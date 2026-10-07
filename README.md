@@ -13,7 +13,7 @@ You need Claude Code 2.1.289 or newer (function-hook plugins).
 From a git repo of this folder:
 
 ```bash
-claude plugin marketplace add <github-user>/illa-mods
+claude plugin marketplace add okashiina/illa-mods
 claude plugin install opus-conductor@illa-mods
 ```
 
