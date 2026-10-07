@@ -1,0 +1,7 @@
+{
+  "name": "opus-conductor",
+  "version": "1.1.0",
+  "description": "Opus 5.5 conducts a mission: plans sized tasks, delegates hard labor to Sonnet 5.5 workers, and shows every agent, what it is doing and the mission's % in a live pane",
+  "author": { "name": "illa" },
+  "types": "./types/index.d.ts"
+}
