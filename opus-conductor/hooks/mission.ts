@@ -133,9 +133,9 @@ export function applyAction(
     m.status = 'done'
     m.endedAt = now
     m.note = note
-    // whatever was in flight when the mission was verified is finished with it
+    // a verified mission finishes every task still on its plan
     for (const t of m.tasks) {
-      if (t.status === 'active') {
+      if (t.status === 'active' || t.status === 'pending') {
         t.status = 'done'
         t.doneAt = now
       }
@@ -195,8 +195,12 @@ export function describeCall(tool: string, input: Record<string, unknown>): stri
   const file = (v: unknown) => String(v ?? '').split(/[\\/]/).pop() ?? ''
   switch (tool) {
     case 'Bash':
-    case 'PowerShell':
-      return `$ ${clip(input.command, 70)}`
+    case 'PowerShell': {
+      // the step that matters, not the cd and variables in front of it
+      const parts = String(input.command ?? '').split(/&&|;|\n/).map(x => x.trim()).filter(Boolean)
+      const step = parts.filter(x => !/^(cd|set|export|\$?[A-Za-z_][A-Za-z0-9_]*=)/.test(x)).pop() ?? parts.pop() ?? ''
+      return `$ ${clip(step, 70)}`
+    }
     case 'Read':
       return `reading ${file(input.file_path)}`
     case 'Edit':

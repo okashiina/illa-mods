@@ -70,8 +70,35 @@ test('during a mission labor runs on Sonnet 5.5, never Haiku, and lands on the b
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ plugin: 'opus-conductor', surface, ...PANE })
-    expect(await ui.find({ type: 'Text', text: /AGENTS · 2 running/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /AGENTS  2 working/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /#1 write the lexer/ })).toBeDefined()
     await ui.unmount()
   }
+})
+
+test('a finished mission does not pin the board at 100%: more work reopens it, a new plan starts fresh', async ($, on) => {
+  mock.clock(on, { now: 1000 })
+  mock.store(on)
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.status', () => ({ value: undefined }))
+  const call = (input: object) => $.tool.call({ tool: 'mcp__opus-conductor__mission', ...input } as never)
+  await call({ action: 'plan', tasks: [{ title: 'audit portfolio' }] })
+  await call({ action: 'complete', note: 'ok' })
+  await call({ action: 'add', tasks: [{ title: 'kessoku shots' }] })
+
+  const draw = async () => {
+    const ui = await $.ui.mount({ plugin: 'opus-conductor', surface: 'terminal', ...PANE })
+    const text = (await ui.find({ type: 'Text', text: /tasks done|Planning/ }))?.text ?? ''
+    await ui.unmount()
+    return text
+  }
+  expect(await draw()).toBe('1 of 2 tasks done')
+
+  await call({ action: 'complete' })
+  await call({ action: 'plan', tasks: [{ title: 'brand new mission' }] })
+  expect(await draw()).toBe('0 of 1 tasks done')
+})
+
+test('a bash step reads as the command that matters', async () => {
+  expect(describeCall('Bash', { command: 'cd /c/Projects/portfolio && SP="C:/x" && npx playwright test shots.spec.ts' })).toBe('$ npx playwright test shots.spec.ts')
 })

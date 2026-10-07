@@ -172,7 +172,15 @@ export const register: Register = on => {
     if (e.tool === missionTool) {
       let reply = ''
       await setMission($, m => {
-        const base = m && m.status !== 'stopped' ? m : newMission(clip((input.tasks as { title?: string }[] | undefined)?.[0]?.title ?? 'Mission', 120), now)
+        const first = clip((input.tasks as { title?: string }[] | undefined)?.[0]?.title ?? 'Mission', 120)
+        const action = String(input.action ?? '')
+        // a finished mission is history: a new plan is a new mission, more work reopens it
+        const base =
+          !m || m.status === 'stopped' || (m.status === 'done' && action === 'plan')
+            ? newMission(first, now)
+            : m.status === 'done' && (action === 'add' || action === 'start')
+              ? { ...m, status: 'running' as const, endedAt: 0, continues: 0 }
+              : m
         const r = applyAction(base, input, now)
         reply = r.text
         return r.mission
@@ -361,6 +369,29 @@ function barSvg(fraction: number, color: string, width: number): string {
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="8" viewBox="0 0 ${width} 8"><rect width="${width}" height="8" rx="4" fill="${COLOR.track}" fill-opacity="0.25"/><rect width="${(f * width).toFixed(1)}" height="8" rx="4" fill="${color}"/></svg>`
 }
 
+/** One segment per live task, colored by where it stands: the plan at a glance. */
+function segmentsSvg(tasks: readonly Task[], width: number): string {
+  const live = tasks.filter(t => t.status !== 'dropped')
+  if (!live.length) return barSvg(0, COLOR.track, width)
+  const gap = 3
+  const w = (width - gap * (live.length - 1)) / live.length
+  const rects = live
+    .map((t, i) => {
+      const color = t.status === 'done' ? COLOR.done : t.status === 'active' ? (t.owner === 'opus' ? COLOR.opus : COLOR.sonnet) : COLOR.track
+      const opacity = t.status === 'pending' ? 0.3 : 1
+      return `<rect x="${(i * (w + gap)).toFixed(1)}" width="${Math.max(2, w).toFixed(1)}" height="6" rx="3" fill="${color}" fill-opacity="${opacity}"/>`
+    })
+    .join('')
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="6" viewBox="0 0 ${width} 6">${rects}</svg>`
+}
+
+function segmentsText(tasks: readonly Task[]): string {
+  return tasks
+    .filter(t => t.status !== 'dropped')
+    .map(t => (t.status === 'done' ? '■' : t.status === 'active' ? '▣' : '□'))
+    .join('')
+}
+
 type View = { m: Mission | null; agents: readonly AgentRow[]; settings: ConductorSettings; now: number; width: number }
 
 function drawPane($: EngineInterface, table: Kit, v: View) {
@@ -375,64 +406,84 @@ function drawPane($: EngineInterface, table: Kit, v: View) {
       return (
         <Box flexDirection="column">
           <Text bold color={COLOR.opus}>◆ Opus Conductor</Text>
-          <Text dimColor>No mission. Type /conduct &lt;what done looks like&gt; and Opus 5.5 plans it, delegates the labor to Sonnet 5.5 workers, and reports here.</Text>
+          <Text dimColor>No mission yet. Type /conduct, pick conduct (opus-conductor), and describe what done looks like. Opus 5.5 plans it, Sonnet 5.5 workers build it, and it all shows up here.</Text>
         </Box>
       )
     }
     const p = progress(m, agents)
     const left = eta(m, agents, now)
     const tone = m.status === 'done' ? COLOR.done : m.status === 'waiting' ? COLOR.wait : m.status === 'stopped' ? COLOR.track : COLOR.opus
-    const word = m.status === 'done' ? `done ✓ in ${minutes(m.endedAt - m.startedAt)}` : m.status === 'stopped' ? 'stopped' : m.status === 'waiting' ? 'waiting on you' : m.planAt ? `${p.doneN} of ${p.n} tasks` : 'planning…'
-    const stats = [
-      m.status === 'running' || m.status === 'waiting' ? `${minutes(now - m.startedAt)} elapsed` : '',
+    const word =
+      m.status === 'done' ? `Done ✓ in ${minutes(m.endedAt - m.startedAt)}` : m.status === 'stopped' ? 'Stopped' : m.status === 'waiting' ? 'Waiting on you' : m.planAt ? `${p.doneN} of ${p.n} tasks done` : 'Planning…'
+    const meta = [
+      m.status === 'running' || m.status === 'waiting' ? `⏱ ${minutes(now - m.startedAt)}` : '',
       left !== null ? `~${minutes(left)} left` : '',
-      `autopilot ${settings.auto ? `on ${m.continues}/${settings.maxContinues}` : 'off'}`,
+      settings.auto ? `autopilot ${m.continues}/${settings.maxContinues}` : 'autopilot off',
     ].filter(Boolean)
+    const live = m.status === 'running' || m.status === 'waiting'
     return (
       <Box flexDirection="column" rowGap={0}>
         <Box flexDirection="row" columnGap={2} alignItems="center">
           {Svg && <Svg source={ringSvg(p.fraction, `${p.pct}%`, tone)} alt={`Mission ${p.pct} percent done`} width={76} height={76} />}
-          <Box flexDirection="column" flexGrow={1}>
+          <Box flexDirection="column" flexGrow={1} flexShrink={1}>
             <Text bold color={COLOR.opus}>◆ OPUS CONDUCTOR</Text>
             <Text bold wrap="wrap">{m.title}</Text>
-            <Text color={tone}>
-              {Svg ? word : `${p.pct}% · ${word}`}
-            </Text>
+            <Text color={tone} bold>{Svg ? word : `${p.pct}% · ${word}`}</Text>
           </Box>
         </Box>
-        {!Svg && m.planAt > 0 && bar(p.fraction, tone, Math.min(width - 2, 60))}
-        <Text dimColor wrap="truncate-end">{stats.join(' · ')}</Text>
-        <Text wrap="truncate-end">
-          <Text color={COLOR.opus} bold>Opus 5.5 </Text>
-          <Text dimColor>· {m.status === 'waiting' ? m.note : m.doing}</Text>
-        </Text>
+        {m.planAt > 0 &&
+          (Svg ? (
+            <Svg source={segmentsSvg(m.tasks, Math.max(120, Math.min(width, 90) * 7))} alt={`${p.doneN} of ${p.n} tasks done`} />
+          ) : (
+            <Text color={tone}>{segmentsText(m.tasks)}</Text>
+          ))}
+        <Text dimColor wrap="truncate-end">{meta.join('  ·  ')}</Text>
+        {live && (
+          <Text wrap="truncate-end">
+            <Text color={COLOR.opus} bold>Opus 5.5 </Text>
+            <Text dimColor>{m.status === 'waiting' ? `asks: ${m.note}` : m.doing}</Text>
+          </Text>
+        )}
       </Box>
     )
   })()
 
   const running = agents.filter(a => a.status === 'running')
-  const finished = agents.filter(a => a.status !== 'running').slice(-6).reverse()
-  const agentCard = (a: AgentRow) => {
-    const icon = a.status === 'running' ? '●' : a.status === 'done' ? '✓' : a.status === 'failed' ? '✗' : '■'
-    const tone = a.status === 'running' ? modelColor(a.model) : a.status === 'done' ? COLOR.done : a.status === 'failed' ? COLOR.fail : COLOR.track
-    const time = a.status === 'running' ? `running ${minutes(now - a.startedAt)}` : `${a.status} in ${minutes(a.endedAt - a.startedAt)}`
+  const finished = agents.filter(a => a.status !== 'running').reverse()
+  const shownFinished = finished.slice(0, 5)
+
+  const runningCard = (a: AgentRow) => {
+    const tone = modelColor(a.model)
     return (
       <Box flexDirection="column" key={`agent-${a.id}`} borderStyle="round" borderColor={tone} paddingX={1}>
         <Box flexDirection="row" justifyContent="space-between" columnGap={1}>
           <Text wrap="truncate-end">
-            <Text color={tone}>{icon} </Text>
-            <Text bold color={modelColor(a.model)}>{modelName(a.model)} </Text>
-            <Text>{a.label}</Text>
+            <Text color={tone}>● </Text>
+            <Text bold color={tone}>{modelName(a.model)} </Text>
+            <Text bold>{a.label}</Text>
           </Text>
-          <Text dimColor>{`${time} · ${a.tools} tools`}</Text>
+          <Text dimColor>{`${minutes(now - a.startedAt)} · ${a.tools} tools`}</Text>
         </Box>
-        {a.status === 'running' && (
-          <Box flexDirection="row" columnGap={1} alignItems="center">
-            {bar(a.pct / 100, tone, Math.min(24, Math.max(8, width - 30)))}
-            <Text dimColor>{a.pct ? `${a.pct}%` : '—'}</Text>
-          </Box>
-        )}
-        <Text dimColor wrap="truncate-end">{a.status === 'running' ? `▸ ${a.doing}` : a.summary || a.doing}</Text>
+        <Box flexDirection="row" columnGap={1} alignItems="center">
+          {bar(a.pct / 100, tone, Math.min(24, Math.max(8, width - 30)))}
+          <Text dimColor>{a.pct ? `${a.pct}%` : 'working…'}</Text>
+        </Box>
+        <Text dimColor wrap="truncate-end">{`▸ ${a.doing}`}</Text>
+      </Box>
+    )
+  }
+
+  const finishedRow = (a: AgentRow) => {
+    const icon = a.status === 'done' ? '✓' : a.status === 'failed' ? '✗' : '■'
+    const tone = a.status === 'done' ? COLOR.done : a.status === 'failed' ? COLOR.fail : COLOR.track
+    return (
+      <Box flexDirection="row" justifyContent="space-between" columnGap={1} key={`agent-${a.id}`}>
+        <Text wrap="truncate-end">
+          <Text color={tone}>{icon} </Text>
+          <Text color={modelColor(a.model)}>{modelName(a.model)} </Text>
+          <Text dimColor>{a.label}</Text>
+        </Text>
+        <Text dimColor>{`${minutes(a.endedAt - a.startedAt)} · ${a.tools} tools`}</Text>
       </Box>
     )
   }
@@ -445,27 +496,39 @@ function drawPane($: EngineInterface, table: Kit, v: View) {
         <Text color={tone}>{icon} </Text>
         <Text dimColor>{`#${t.id} ${t.size} `}</Text>
         <Text color={t.owner === 'opus' ? COLOR.opus : COLOR.sonnet}>{t.owner === 'opus' ? 'Opus  ' : 'Sonnet'} </Text>
-        <Text dimColor={t.status === 'done' || t.status === 'dropped'} strikethrough={t.status === 'dropped'}>{t.title}</Text>
+        <Text bold={t.status === 'active'} dimColor={t.status === 'done' || t.status === 'dropped'} strikethrough={t.status === 'dropped'}>{t.title}</Text>
       </Text>
     )
   }
+
+  // the plan keeps what's moving in view: the last two done, then everything open
+  const plan = (() => {
+    if (!m) return null
+    const done = m.tasks.filter(t => t.status === 'done')
+    const hiddenDone = Math.max(0, done.length - 2)
+    const keep = new Set(done.slice(-2).map(t => t.id))
+    const rows = m.tasks.filter(t => t.status !== 'done' || keep.has(t.id))
+    return { hiddenDone, rows }
+  })()
 
   const live = !!m && (m.status === 'running' || m.status === 'waiting')
 
   return (
     <Box flexDirection="column" rowGap={1}>
       {header}
-      <Box flexDirection="column">
-        <Text bold>{`AGENTS · ${running.length} running · ${agents.length - running.length} finished`}</Text>
+      <Box flexDirection="column" rowGap={0}>
+        <Text bold>{`AGENTS  ${running.length} working · ${finished.length} done`}</Text>
         {!agents.length && <Text dimColor>No agents launched yet.</Text>}
-        {running.map(agentCard)}
-        {finished.map(agentCard)}
+        {running.map(runningCard)}
+        {shownFinished.map(finishedRow)}
+        {finished.length > shownFinished.length && <Text dimColor>{`+${finished.length - shownFinished.length} earlier`}</Text>}
       </Box>
-      {m && (
+      {m && plan && (
         <Box flexDirection="column">
           <Text bold>PLAN</Text>
           {!m.tasks.length && <Text dimColor>Waiting for Opus to plan…</Text>}
-          {m.tasks.map(taskRow)}
+          {plan.hiddenDone > 0 && <Text color={COLOR.done} dimColor>{`✓ ${plan.hiddenDone} earlier tasks done`}</Text>}
+          {plan.rows.map(taskRow)}
         </Box>
       )}
       <Box flexDirection="row" columnGap={2} flexWrap="wrap">
