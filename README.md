@@ -4,7 +4,7 @@ illa's Claude Code mods, as a plugin marketplace.
 
 | Plugin | What it does |
 | --- | --- |
-| [opus-conductor](opus-conductor/README.md) | Opus 5.5 conducts and Sonnet 5.5 workers build, with a live board of agents and mission % (`/opus-conductor:conduct`) |
+| [opus-conductor](opus-conductor/README.md) | Opus 5.5 conducts, Sonnet 5.5 workers build, and Haiku 5.5 scouts look things up, with a live board of agents and mission % (`/opus-conductor:conduct`) |
 
 ## Install
 

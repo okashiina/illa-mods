@@ -1,5 +1,5 @@
 export type Size = 'S' | 'M' | 'L'
-export type Owner = 'opus' | 'sonnet'
+export type Owner = 'opus' | 'sonnet' | 'haiku'
 export type TaskStatus = 'pending' | 'active' | 'done' | 'dropped'
 
 export type Task = {

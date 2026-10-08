@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { applyAction, describeCall, newMission, progress, taskIdIn } from './mission'
+import { applyAction, describeCall, newMission, progress, steerModel, taskIdIn } from './mission'
 
 const PANE = { component: 'Pane', requestId: 'opus-conductor', props: { title: 'Opus Conductor', isFocused: false, bodyColumns: 80, placement: 'dock' } as never } as const
 
@@ -51,7 +51,7 @@ test('/conduct passes the goal to its markdown brief and starts the board; contr
   }
 })
 
-test('during a mission labor runs on Sonnet 5.5, never Haiku, and lands on the board', async ($, on) => {
+test('during a mission an old Haiku request is lifted to Haiku 5.5, and agents land on the board', async ($, on) => {
   mock.clock(on, { now: 1000 })
   const models: (string | undefined)[] = []
   on('ui.open', () => ({ value: { isPlaced: true } }))
@@ -66,7 +66,7 @@ test('during a mission labor runs on Sonnet 5.5, never Haiku, and lands on the b
 
   await $.agent.spawn({ prompt: 'scan', description: 'explore code', subagentType: 'Explore', model: 'haiku' } as never)
   await $.agent.spawn({ prompt: 'build it', description: '#1 write the lexer', subagentType: 'opus-conductor:worker' } as never)
-  expect(models).toEqual(['claude-sonnet-5-5', undefined])
+  expect(models).toEqual(['claude-haiku-5-5', undefined])
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ plugin: 'opus-conductor', surface, ...PANE })
@@ -101,4 +101,21 @@ test('a finished mission does not pin the board at 100%: more work reopens it, a
 
 test('a bash step reads as the command that matters', async () => {
   expect(describeCall('Bash', { command: 'cd /c/Projects/portfolio && SP="C:/x" && npx playwright test shots.spec.ts' })).toBe('$ npx playwright test shots.spec.ts')
+})
+
+test('model steering: labor on Sonnet 5.5, exploring and Haiku asks on Haiku 5.5, explicit choices stand', async () => {
+  const own = { worker: 'opus-conductor:worker', scout: 'opus-conductor:scout' }
+  expect(steerModel(undefined, 'general-purpose', own)).toBe('claude-sonnet-5-5')
+  expect(steerModel(undefined, 'Explore', own)).toBe('claude-haiku-5-5')
+  expect(steerModel(undefined, own.worker, own)).toBeUndefined()
+  expect(steerModel(undefined, own.scout, own)).toBeUndefined()
+  expect(steerModel('haiku', 'general-purpose', own)).toBe('claude-haiku-5-5')
+  expect(steerModel('claude-haiku-4-5', 'general-purpose', own)).toBe('claude-haiku-5-5')
+  expect(steerModel('claude-haiku-5-5', 'general-purpose', own)).toBeUndefined()
+  expect(steerModel('opus', 'general-purpose', own)).toBeUndefined()
+})
+
+test('the plan takes haiku-owned tasks', async () => {
+  const m = applyAction(newMission('x', 0), { action: 'plan', tasks: [{ title: 'sweep logs', owner: 'haiku' }, { title: 'scout docs', owner: 'scout' }] }, 1).mission
+  expect(m.tasks.map(t => t.owner)).toEqual(['haiku', 'haiku'])
 })

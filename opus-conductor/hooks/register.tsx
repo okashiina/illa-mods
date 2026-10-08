@@ -17,6 +17,8 @@ import type { Elements, EngineInterface, Register } from 'claude-code'
 
 import type { AgentRow, Mission, ConductorSettings, Task } from '../types'
 import {
+  HAIKU,
+  SCOUT,
   SONNET,
   WORKER,
   applyAction,
@@ -30,6 +32,8 @@ import {
   newMission,
   progress,
   reportToolSpec,
+  scoutPrompt,
+  steerModel,
   taskIdIn,
   workerPrompt,
 } from './mission'
@@ -42,7 +46,7 @@ const missionAtom = atom({ plugin: 'opus-conductor', key: 'mission' } as const, 
 const agentsAtom = atom({ plugin: 'opus-conductor', key: 'agents' } as const, [])
 const settingsAtom = atom({ plugin: 'opus-conductor', key: 'settings' } as const, { auto: true, maxContinues: 8 } as ConductorSettings)
 
-const COLOR = { opus: '#D97757', sonnet: '#6A9BCC', done: '#3FB950', wait: '#D29922', fail: '#F85149', track: '#8B949E' }
+const COLOR = { opus: '#D97757', sonnet: '#6A9BCC', haiku: '#3FB8AF', done: '#3FB950', wait: '#D29922', fail: '#F85149', track: '#8B949E' }
 
 type $ = EngineInterface
 type Kit = Elements[keyof Elements]
@@ -85,6 +89,7 @@ export const register: Register = on => {
   let missionTool = `mcp__${PLUGIN}__mission`
   let reportTool = `mcp__${PLUGIN}__report`
   let workerType = `${PLUGIN}:${WORKER}`
+  let scoutType = `${PLUGIN}:${SCOUT}`
   let warnedModel = false
 
   on('session.start', async ($, e, next) => {
@@ -108,6 +113,19 @@ export const register: Register = on => {
       ).agent
     } catch (err) {
       $.ui.log(`opus-conductor: worker agent did not register (${String(err)})`)
+    }
+    try {
+      scoutType = (
+        await $.agent.register({
+          name: SCOUT,
+          description:
+            'Haiku 5.5 scout for the Opus Conductor: fast and cheap for ONE narrow job with a clear answer: lookups, file and log sweeps, extraction, summaries, triage, running a named check and reporting the result. Not for design, complex coding or security work.',
+          prompt: scoutPrompt(reportTool),
+          model: HAIKU,
+        })
+      ).agent
+    } catch (err) {
+      $.ui.log(`opus-conductor: scout agent did not register (${String(err)})`)
     }
     // elapsed times and ETAs move while nothing is written
     $.clock.every(5000, () => {
@@ -215,8 +233,9 @@ export const register: Register = on => {
     const m = await read($, missionAtom)
     let input = e
     if (isLive(m) && !e.fork) {
-      // Opus manages; labor runs on Sonnet 5.5 unless Opus asked for a model. Never Haiku.
-      if (/haiku/i.test(e.model ?? '') || (!e.model && e.subagentType !== workerType)) input = { ...e, model: SONNET }
+      // Opus manages: labor on Sonnet 5.5, narrow read-heavy jobs on Haiku 5.5
+      const model = steerModel(e.model, e.subagentType, { worker: workerType, scout: scoutType })
+      if (model) input = { ...e, model }
       if (!e.parentAgentId && !/opus/i.test(e.parentModel) && !warnedModel) {
         warnedModel = true
         $.ui.toast(`Conductor is running on ${e.parentModel}, not Opus 5.5: switch the session model for the full effect`)
@@ -348,8 +367,14 @@ function modelName(id: string): string {
 }
 
 function modelColor(id: string): string {
-  return /opus/i.test(id) ? COLOR.opus : /sonnet/i.test(id) ? COLOR.sonnet : COLOR.track
+  return /opus/i.test(id) ? COLOR.opus : /sonnet/i.test(id) ? COLOR.sonnet : /haiku/i.test(id) ? COLOR.haiku : COLOR.track
 }
+
+function ownerColor(owner: Task['owner']): string {
+  return owner === 'opus' ? COLOR.opus : owner === 'haiku' ? COLOR.haiku : COLOR.sonnet
+}
+
+const OWNER_LABEL: Record<Task['owner'], string> = { opus: 'Opus  ', sonnet: 'Sonnet', haiku: 'Haiku ' }
 
 function textBar(fraction: number, width: number): string {
   const w = Math.max(8, width)
@@ -377,7 +402,7 @@ function segmentsSvg(tasks: readonly Task[], width: number): string {
   const w = (width - gap * (live.length - 1)) / live.length
   const rects = live
     .map((t, i) => {
-      const color = t.status === 'done' ? COLOR.done : t.status === 'active' ? (t.owner === 'opus' ? COLOR.opus : COLOR.sonnet) : COLOR.track
+      const color = t.status === 'done' ? COLOR.done : t.status === 'active' ? ownerColor(t.owner) : COLOR.track
       const opacity = t.status === 'pending' ? 0.3 : 1
       return `<rect x="${(i * (w + gap)).toFixed(1)}" width="${Math.max(2, w).toFixed(1)}" height="6" rx="3" fill="${color}" fill-opacity="${opacity}"/>`
     })
@@ -406,7 +431,7 @@ function drawPane($: EngineInterface, table: Kit, v: View) {
       return (
         <Box flexDirection="column">
           <Text bold color={COLOR.opus}>◆ Opus Conductor</Text>
-          <Text dimColor>No mission yet. Type /conduct, pick conduct (opus-conductor), and describe what done looks like. Opus 5.5 plans it, Sonnet 5.5 workers build it, and it all shows up here.</Text>
+          <Text dimColor>No mission yet. Type /conduct, pick conduct (opus-conductor), and describe what done looks like. Opus 5.5 plans it, Sonnet 5.5 workers build, Haiku 5.5 scouts look things up, and it all shows up here.</Text>
         </Box>
       )
     }
@@ -490,12 +515,12 @@ function drawPane($: EngineInterface, table: Kit, v: View) {
 
   const taskRow = (t: Task) => {
     const icon = t.status === 'done' ? '✓' : t.status === 'active' ? '▶' : t.status === 'dropped' ? '×' : '○'
-    const tone = t.status === 'done' ? COLOR.done : t.status === 'active' ? (t.owner === 'opus' ? COLOR.opus : COLOR.sonnet) : COLOR.track
+    const tone = t.status === 'done' ? COLOR.done : t.status === 'active' ? ownerColor(t.owner) : COLOR.track
     return (
       <Text wrap="truncate-end" key={`task-${t.id}`}>
         <Text color={tone}>{icon} </Text>
         <Text dimColor>{`#${t.id} ${t.size} `}</Text>
-        <Text color={t.owner === 'opus' ? COLOR.opus : COLOR.sonnet}>{t.owner === 'opus' ? 'Opus  ' : 'Sonnet'} </Text>
+        <Text color={ownerColor(t.owner)}>{OWNER_LABEL[t.owner]} </Text>
         <Text bold={t.status === 'active'} dimColor={t.status === 'done' || t.status === 'dropped'} strikethrough={t.status === 'dropped'}>{t.title}</Text>
       </Text>
     )

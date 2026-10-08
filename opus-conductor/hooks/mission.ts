@@ -5,7 +5,9 @@
 import type { AgentRow, Mission, Owner, Size, Task } from '../types'
 
 export const SONNET = 'claude-sonnet-5-5'
+export const HAIKU = 'claude-haiku-5-5'
 export const WORKER = 'worker'
+export const SCOUT = 'scout'
 const SIZES: Record<Size, number> = { S: 1, M: 2, L: 3 }
 const STOP = /^(stop|cancel|off|end|abort)$/i
 
@@ -50,7 +52,19 @@ function sizeOf(v: unknown): Size {
 }
 
 function ownerOf(v: unknown): Owner {
-  return /opus/i.test(String(v ?? '')) ? 'opus' : 'sonnet'
+  const s = String(v ?? '')
+  return /opus/i.test(s) ? 'opus' : /haiku|scout/i.test(s) ? 'haiku' : 'sonnet'
+}
+
+/**
+ * The model a mission's spawn should run on, or undefined to leave the call as made.
+ * Labor defaults to Sonnet 5.5; read-only exploring defaults to Haiku 5.5; any
+ * Haiku request is lifted to Haiku 5.5; an explicit Sonnet/Opus/Fable choice stands.
+ */
+export function steerModel(model: string | undefined, subagentType: string, own: { worker: string; scout: string }): string | undefined {
+  if (model) return /haiku/i.test(model) && !/5[-.]5/.test(model) ? HAIKU : undefined
+  if (subagentType === own.worker || subagentType === own.scout) return undefined
+  return /^explore$/i.test(subagentType) ? HAIKU : SONNET
 }
 
 function makeTasks(m: Mission, raw: unknown): Task[] {
@@ -229,7 +243,7 @@ export function missionToolSpec(name: string) {
     name,
     description:
       'Opus Conductor mission board: the plan the person watches live. Actions: ' +
-      '"plan" (replace pending tasks) / "add" with tasks [{ title, size: S|M|L, owner: "opus"|"sonnet" }]; ' +
+      '"plan" (replace pending tasks) / "add" with tasks [{ title, size: S|M|L, owner: "opus"|"sonnet"|"haiku" }]; ' +
       '"start" / "done" / "drop" with ids [n] and an optional note; "wait" with a note when you need the person; ' +
       '"complete" with a note once the whole mission is verified; "show". Mark a task done only after you verified its result.',
     inputSchema: {
@@ -243,7 +257,7 @@ export function missionToolSpec(name: string) {
             properties: {
               title: { type: 'string' },
               size: { type: 'string', enum: ['S', 'M', 'L'] },
-              owner: { type: 'string', enum: ['opus', 'sonnet'] },
+              owner: { type: 'string', enum: ['opus', 'sonnet', 'haiku'] },
             },
             required: ['title'],
           },
@@ -269,6 +283,17 @@ export function reportToolSpec(name: string) {
       required: ['pct', 'doing'],
     },
   }
+}
+
+export function scoutPrompt(reportTool: string): string {
+  return `You are a Haiku 5.5 scout under an Opus 5.5 conductor. You do one narrow, well-defined job fast: look things up, read and sweep files, extract or summarize, triage, or run a named check and report what it says.
+
+Rules:
+- Do exactly the job in the brief. Do not design, refactor, or decide; if the job needs judgment the brief does not settle, stop and say so.
+- Prefer reading over writing. Edit files only when the brief names the exact change.
+- Quote evidence: file paths with line numbers, command output, URLs. Never guess a value you could not find; say it is missing.
+- Report progress with ${reportTool} (pct 0-100 and a few words) after each meaningful step, and pct 100 just before you finish.
+- Finish with a compact result in the shape the brief asks for, then any gaps.`
 }
 
 export function workerPrompt(reportTool: string): string {
