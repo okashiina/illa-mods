@@ -19,12 +19,16 @@ import type { AgentRow, Mission, ConductorSettings, Task } from '../types'
 import {
   HAIKU,
   SCOUT,
+  SCOUT_EFFORTS,
   SONNET,
   WORKER,
+  WORKER_EFFORTS,
+  agentName,
   applyAction,
   clip,
   continuation,
   describeCall,
+  effortOf,
   eta,
   isStopWord,
   minutes,
@@ -45,6 +49,19 @@ const RECENT_MS = 10 * 60000
 const missionAtom = atom({ plugin: 'opus-conductor', key: 'mission' } as const, null)
 const agentsAtom = atom({ plugin: 'opus-conductor', key: 'agents' } as const, [])
 const settingsAtom = atom({ plugin: 'opus-conductor', key: 'settings' } as const, { auto: true, maxContinues: 8 } as ConductorSettings)
+
+const WORKER_USE: Record<string, string> = {
+  low: 'mechanical edits from an exact spec, renames, formatting, boilerplate',
+  medium: 'clear-brief implementation and coordinated small changes (the default for agentic coding)',
+  high: 'nontrivial implementation, refactors across modules, tests with tricky cases, bounded debugging',
+  xhigh: 'hard multi-step debugging or long multi-file builds where a miss is costly',
+}
+
+const SCOUT_USE: Record<string, string> = {
+  low: 'single lookups, greps, pulling one value, running one named check',
+  medium: 'summaries, triage, extraction across several files or docs',
+  high: 'careful cross-checking, browser flows, sweeps where a wrong answer is costly',
+}
 
 const COLOR = { opus: '#D97757', sonnet: '#6A9BCC', haiku: '#3FB8AF', done: '#3FB950', wait: '#D29922', fail: '#F85149', track: '#8B949E' }
 
@@ -88,8 +105,8 @@ export const register: Register = on => {
   // Recomputed on every load: session.start registers them again.
   let missionTool = `mcp__${PLUGIN}__mission`
   let reportTool = `mcp__${PLUGIN}__report`
-  let workerType = `${PLUGIN}:${WORKER}`
-  let scoutType = `${PLUGIN}:${SCOUT}`
+  const workerType = `${PLUGIN}:${WORKER}`
+  const scoutType = `${PLUGIN}:${SCOUT}`
   let warnedModel = false
 
   on('session.start', async ($, e, next) => {
@@ -101,31 +118,32 @@ export const register: Register = on => {
     } catch (err) {
       $.ui.log(`opus-conductor: tools did not register (${String(err)})`)
     }
-    try {
-      workerType = (
+    // one agent type per (kind, effort): Opus picks the effort by picking the type
+    for (const effort of WORKER_EFFORTS) {
+      try {
         await $.agent.register({
-          name: WORKER,
-          description:
-            'Sonnet 5.5 worker for the Opus Conductor. Give it ONE well-scoped outcome with a full delegation contract: implementation against settled interfaces, refactors, tests, extraction, bounded debugging or research sweeps.',
+          name: agentName('worker', effort),
+          description: `Sonnet 5.5 worker at ${effort} effort, for the Opus Conductor: ONE well-scoped outcome with a full delegation contract. Fits ${WORKER_USE[effort]}.`,
           prompt: workerPrompt(reportTool),
           model: SONNET,
+          effort,
         })
-      ).agent
-    } catch (err) {
-      $.ui.log(`opus-conductor: worker agent did not register (${String(err)})`)
+      } catch (err) {
+        $.ui.log(`opus-conductor: worker-${effort} did not register (${String(err)})`)
+      }
     }
-    try {
-      scoutType = (
+    for (const effort of SCOUT_EFFORTS) {
+      try {
         await $.agent.register({
-          name: SCOUT,
-          description:
-            'Haiku 5.5 scout for the Opus Conductor: fast and cheap for ONE narrow job with a clear answer: lookups, file and log sweeps, extraction, summaries, triage, running a named check and reporting the result. Not for design, complex coding or security work.',
+          name: agentName('scout', effort),
+          description: `Haiku 5.5 scout at ${effort} effort, for the Opus Conductor: ONE narrow job with a checkable answer. Fits ${SCOUT_USE[effort]}. Not for design, complex coding or security work.`,
           prompt: scoutPrompt(reportTool),
           model: HAIKU,
+          effort,
         })
-      ).agent
-    } catch (err) {
-      $.ui.log(`opus-conductor: scout agent did not register (${String(err)})`)
+      } catch (err) {
+        $.ui.log(`opus-conductor: scout-${effort} did not register (${String(err)})`)
+      }
     }
     // elapsed times and ETAs move while nothing is written
     $.clock.every(5000, () => {
@@ -247,6 +265,8 @@ export const register: Register = on => {
 
     const now = await $.clock.now()
     const taskId = taskIdIn(e.description, e.prompt)
+    const ownType = e.subagentType.startsWith(workerType) || e.subagentType.startsWith(scoutType)
+    const effort = ownType ? effortOf(e.subagentType) : undefined
     const row: AgentRow = {
       id: r.agentId,
       label: clip(e.description || e.name || e.subagentType, 60),
@@ -260,11 +280,12 @@ export const register: Register = on => {
       pct: 0,
       taskId,
       summary: '',
+      ...(effort ? { effort } : {}),
     }
     await setAgents($, list => [...list.filter(a => a.id !== row.id), row])
     if (taskId && isLive(m)) {
       await setMission($, x =>
-        x ? { ...x, tasks: x.tasks.map(t => (t.id === taskId && t.status === 'pending' ? { ...t, status: 'active', startedAt: now, agentId: row.id } : t.id === taskId ? { ...t, agentId: row.id } : t)) } : x,
+        x ? { ...x, tasks: x.tasks.map(t => (t.id !== taskId ? t : { ...t, ...(t.status === 'pending' ? { status: 'active' as const, startedAt: now } : {}), agentId: row.id, ...(effort && !t.effort ? { effort } : {}) })) } : x,
       )
     }
     return r
@@ -376,6 +397,9 @@ function ownerColor(owner: Task['owner']): string {
 
 const OWNER_LABEL: Record<Task['owner'], string> = { opus: 'Opus  ', sonnet: 'Sonnet', haiku: 'Haiku ' }
 
+/** a fixed-width effort tag so task titles stay aligned */
+const EFFORT_TAG: Record<NonNullable<Task['effort']>, string> = { low: 'low ', medium: 'med ', high: 'high', xhigh: 'xhi ' }
+
 function textBar(fraction: number, width: number): string {
   const w = Math.max(8, width)
   const n = Math.round(Math.max(0, Math.min(1, fraction)) * w)
@@ -484,7 +508,8 @@ function drawPane($: EngineInterface, table: Kit, v: View) {
         <Box flexDirection="row" justifyContent="space-between" columnGap={1}>
           <Text wrap="truncate-end">
             <Text color={tone}>● </Text>
-            <Text bold color={tone}>{modelName(a.model)} </Text>
+            <Text bold color={tone}>{modelName(a.model)}</Text>
+            <Text dimColor>{a.effort ? ` · ${a.effort} ` : ' '}</Text>
             <Text bold>{a.label}</Text>
           </Text>
           <Text dimColor>{`${minutes(now - a.startedAt)} · ${a.tools} tools`}</Text>
@@ -505,7 +530,8 @@ function drawPane($: EngineInterface, table: Kit, v: View) {
       <Box flexDirection="row" justifyContent="space-between" columnGap={1} key={`agent-${a.id}`}>
         <Text wrap="truncate-end">
           <Text color={tone}>{icon} </Text>
-          <Text color={modelColor(a.model)}>{modelName(a.model)} </Text>
+          <Text color={modelColor(a.model)}>{modelName(a.model)}</Text>
+          <Text dimColor>{a.effort ? ` · ${a.effort} ` : ' '}</Text>
           <Text dimColor>{a.label}</Text>
         </Text>
         <Text dimColor>{`${minutes(a.endedAt - a.startedAt)} · ${a.tools} tools`}</Text>
@@ -521,6 +547,7 @@ function drawPane($: EngineInterface, table: Kit, v: View) {
         <Text color={tone}>{icon} </Text>
         <Text dimColor>{`#${t.id} ${t.size} `}</Text>
         <Text color={ownerColor(t.owner)}>{OWNER_LABEL[t.owner]} </Text>
+        {t.effort && <Text dimColor>{`${EFFORT_TAG[t.effort]} `}</Text>}
         <Text bold={t.status === 'active'} dimColor={t.status === 'done' || t.status === 'dropped'} strikethrough={t.status === 'dropped'}>{t.title}</Text>
       </Text>
     )

@@ -2,12 +2,28 @@
 // progress the pane draws from it, and the words the mod hands the models.
 // Pure functions, no `$`: the tests drive them directly.
 
-import type { AgentRow, Mission, Owner, Size, Task } from '../types'
+import type { AgentRow, Effort, Mission, Owner, Size, Task } from '../types'
 
 export const SONNET = 'claude-sonnet-5-5'
 export const HAIKU = 'claude-haiku-5-5'
 export const WORKER = 'worker'
 export const SCOUT = 'scout'
+
+/** One registered agent type per effort: the Agent tool can't set effort per call. */
+export const WORKER_EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh']
+export const SCOUT_EFFORTS: readonly Effort[] = ['low', 'medium', 'high']
+const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh']
+
+export function effortOf(v: unknown): Effort | undefined {
+  const hit = /(?:^|[-\s:])(xhigh|high|medium|low)$/i.exec(String(v ?? '').trim())
+  const e = hit?.[1]?.toLowerCase() as Effort | undefined
+  return e && EFFORTS.includes(e) ? e : undefined
+}
+
+/** worker-high, scout-low, ...: the agent type for a kind of helper at one effort */
+export function agentName(kind: 'worker' | 'scout', effort: Effort): string {
+  return `${kind}-${effort}`
+}
 const SIZES: Record<Size, number> = { S: 1, M: 2, L: 3 }
 const STOP = /^(stop|cancel|off|end|abort)$/i
 
@@ -44,7 +60,7 @@ export function newMission(condition: string, now: number): Mission {
   }
 }
 
-type RawTask = { title?: unknown; size?: unknown; owner?: unknown }
+type RawTask = { title?: unknown; size?: unknown; owner?: unknown; effort?: unknown }
 
 function sizeOf(v: unknown): Size {
   const s = String(v ?? '').trim().toUpperCase().charAt(0)
@@ -63,7 +79,7 @@ function ownerOf(v: unknown): Owner {
  */
 export function steerModel(model: string | undefined, subagentType: string, own: { worker: string; scout: string }): string | undefined {
   if (model) return /haiku/i.test(model) && !/5[-.]5/.test(model) ? HAIKU : undefined
-  if (subagentType === own.worker || subagentType === own.scout) return undefined
+  if (subagentType.startsWith(own.worker) || subagentType.startsWith(own.scout)) return undefined
   return /^explore$/i.test(subagentType) ? HAIKU : SONNET
 }
 
@@ -76,6 +92,7 @@ function makeTasks(m: Mission, raw: unknown): Task[] {
       title: clip(t.title, 140),
       size: sizeOf(t.size),
       owner: ownerOf(t.owner),
+      ...(effortOf(t.effort) ? { effort: effortOf(t.effort) } : {}),
       status: 'pending' as const,
       agentId: '',
       startedAt: 0,
@@ -191,7 +208,7 @@ export function eta(m: Mission, agents: readonly AgentRow[], now: number): numbe
 
 export function summary(m: Mission): string {
   const p = progress(m)
-  const rows = m.tasks.map(t => `#${t.id} [${t.status}] ${t.size} ${t.owner}: ${t.title}${t.note ? ` (${t.note})` : ''}`)
+  const rows = m.tasks.map(t => `#${t.id} [${t.status}] ${t.size} ${t.owner}${t.effort ? `@${t.effort}` : ''}: ${t.title}${t.note ? ` (${t.note})` : ''}`)
   return [`Mission "${m.title}": ${p.doneN}/${p.n} tasks, ${p.pct}%.`, ...rows].join('\n')
 }
 
@@ -243,7 +260,7 @@ export function missionToolSpec(name: string) {
     name,
     description:
       'Opus Conductor mission board: the plan the person watches live. Actions: ' +
-      '"plan" (replace pending tasks) / "add" with tasks [{ title, size: S|M|L, owner: "opus"|"sonnet"|"haiku" }]; ' +
+      '"plan" (replace pending tasks) / "add" with tasks [{ title, size: S|M|L, owner: "opus"|"sonnet"|"haiku", effort: "low"|"medium"|"high"|"xhigh" }]; ' +
       '"start" / "done" / "drop" with ids [n] and an optional note; "wait" with a note when you need the person; ' +
       '"complete" with a note once the whole mission is verified; "show". Mark a task done only after you verified its result.',
     inputSchema: {
@@ -258,6 +275,7 @@ export function missionToolSpec(name: string) {
               title: { type: 'string' },
               size: { type: 'string', enum: ['S', 'M', 'L'] },
               owner: { type: 'string', enum: ['opus', 'sonnet', 'haiku'] },
+              effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh'] },
             },
             required: ['title'],
           },

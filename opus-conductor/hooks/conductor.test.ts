@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { applyAction, describeCall, newMission, progress, steerModel, taskIdIn } from './mission'
+import { applyAction, describeCall, effortOf, newMission, progress, steerModel, taskIdIn } from './mission'
 
 const PANE = { component: 'Pane', requestId: 'opus-conductor', props: { title: 'Opus Conductor', isFocused: false, bodyColumns: 80, placement: 'dock' } as never } as const
 
@@ -65,13 +65,14 @@ test('during a mission an old Haiku request is lifted to Haiku 5.5, and agents l
   await $.tool.call({ tool: 'mcp__opus-conductor__mission', action: 'plan', tasks: [{ title: 'write the lexer', size: 'M' }] } as never)
 
   await $.agent.spawn({ prompt: 'scan', description: 'explore code', subagentType: 'Explore', model: 'haiku' } as never)
-  await $.agent.spawn({ prompt: 'build it', description: '#1 write the lexer', subagentType: 'opus-conductor:worker' } as never)
+  await $.agent.spawn({ prompt: 'build it', description: '#1 write the lexer', subagentType: 'opus-conductor:worker-high' } as never)
   expect(models).toEqual(['claude-haiku-5-5', undefined])
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ plugin: 'opus-conductor', surface, ...PANE })
     expect(await ui.find({ type: 'Text', text: /AGENTS  2 working/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /#1 write the lexer/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: / · high / })).toBeDefined()
     await ui.unmount()
   }
 })
@@ -118,4 +119,19 @@ test('model steering: labor on Sonnet 5.5, exploring and Haiku asks on Haiku 5.5
 test('the plan takes haiku-owned tasks', async () => {
   const m = applyAction(newMission('x', 0), { action: 'plan', tasks: [{ title: 'sweep logs', owner: 'haiku' }, { title: 'scout docs', owner: 'scout' }] }, 1).mission
   expect(m.tasks.map(t => t.owner)).toEqual(['haiku', 'haiku'])
+})
+
+test('effort comes from the agent type and the plan', async () => {
+  expect(effortOf('opus-conductor:worker-high')).toBe('high')
+  expect(effortOf('opus-conductor:scout-low')).toBe('low')
+  expect(effortOf('opus-conductor:worker-xhigh')).toBe('xhigh')
+  expect(effortOf('general-purpose')).toBeUndefined()
+  const m = applyAction(newMission('x', 0), { action: 'plan', tasks: [{ title: 'fix parser', owner: 'sonnet', effort: 'high' }, { title: 'grep usages', owner: 'haiku' }] }, 1).mission
+  expect(m.tasks.map(t => t.effort)).toEqual(['high', undefined])
+})
+
+test('model steering leaves every effort variant of the conductor agents alone', async () => {
+  const own = { worker: 'opus-conductor:worker', scout: 'opus-conductor:scout' }
+  expect(steerModel(undefined, 'opus-conductor:worker-medium', own)).toBeUndefined()
+  expect(steerModel(undefined, 'opus-conductor:scout-high', own)).toBeUndefined()
 })

@@ -6,7 +6,7 @@ Opus 5.5 is the thinker, manager and integrator. Sonnet 5.5 workers do the hard 
 
 | Type | Does |
 | --- | --- |
-| `/opus-conductor:conduct <what done looks like>` | Starts a mission. Opus plans sized tasks, delegates them to `opus-conductor:worker` (Sonnet 5.5) or `opus-conductor:scout` (Haiku 5.5), then verifies and integrates. |
+| `/opus-conductor:conduct <what done looks like>` | Starts a mission. Opus plans sized tasks, picks a helper and a reasoning effort for each, delegates, then verifies and integrates. |
 | `/opus-conductor:conduct` | Opens the live board. |
 | `/opus-conductor:conduct stop` · `auto on` · `auto off` · `clear` | Stops the mission, toggles autopilot, or clears the board. |
 
@@ -22,6 +22,16 @@ In the desktop app, type `/conduct` and pick **conduct (opus-conductor)** from t
   | Haiku 5.5 | scout | Lookups, file and log sweeps, extraction, summaries, triage, running a check and reporting it, browser checks. |
 
   Haiku 5.5 costs $0.10 / $0.50 per MTok for prompts up to 100K tokens. It is strong at narrow work (OSWorld 72%) but well behind Sonnet on complex agentic coding (Terminal-Bench 4.0: 39% vs 71%), so it never gets design or hard coding. Its cyber safeguards also block pentest-style work.
+- **Reasoning effort, picked per task by Opus:** the Agent tool can't set effort per call, so there is one agent type per effort.
+
+  | Effort | `opus-conductor:worker-*` (Sonnet 5.5) | `opus-conductor:scout-*` (Haiku 5.5) |
+  | --- | --- | --- |
+  | `low` | mechanical edits from an exact spec | single lookups, greps, one value, one named check |
+  | `medium` | clear-brief implementation (the default for agentic coding) | summaries, triage, extraction across several files |
+  | `high` | nontrivial implementation, cross-module refactors, tricky tests, bounded debugging | careful cross-checks, browser flows, costly-if-wrong sweeps |
+  | `xhigh` | hard multi-step debugging, long multi-file builds where a miss is costly | not offered |
+
+  Opus starts workers at `medium` and scouts at `low`. It raises one level for each thing that makes a task harder: unfamiliar code, subtle invariants, many interacting files, a fix that must hold under tests. It lowers one level for repetitive work. Task size alone never raises effort. Plan tasks record their effort, and the board shows it on each task and agent. Opus's own effort is the session's setting.
 - **Model steering during a mission:**
   - Subagents with no model set run on Sonnet 5.5.
   - Explore agents run on Haiku 5.5.

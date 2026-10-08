@@ -1,7 +1,9 @@
 {
   "name": "opus-conductor",
-  "version": "1.3.0",
-  "description": "Opus 5.5 conducts a mission: plans sized tasks, delegates hard labor to Sonnet 5.5 workers and narrow jobs to Haiku 5.5 scouts, and shows every agent, what it is doing and the mission's % in a live pane",
-  "author": { "name": "illa" },
+  "version": "1.4.0",
+  "description": "Opus 5.5 conducts a mission: plans sized tasks, delegates hard labor to Sonnet 5.5 workers and narrow jobs to Haiku 5.5 scouts at the reasoning effort each task needs, and shows every agent, what it is doing and the mission's % in a live pane",
+  "author": {
+    "name": "illa"
+  },
   "types": "./types/index.d.ts"
 }
