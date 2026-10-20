@@ -9,6 +9,7 @@ Opus 5.5 is the thinker, manager and integrator. Sonnet 5.5 workers do the hard 
 | `/opus-conductor:conduct <what done looks like>` | Starts a mission. Opus plans sized tasks, picks a helper and a reasoning effort for each, delegates, then verifies and integrates. |
 | `/opus-conductor:conduct` | Opens the live board. |
 | `/opus-conductor:conduct stop` · `auto on` · `auto off` · `clear` | Stops the mission, toggles autopilot, or clears the board. |
+| mission tool action `hold` (Opus calls it) | Opus is waiting on something outside the session: a render, CI, a background command. Autopilot stays quiet until a task notification, you, or its timer wakes it. |
 
 In the desktop app, type `/conduct` and pick **conduct (opus-conductor)** from the menu.
 
@@ -37,7 +38,13 @@ In the desktop app, type `/conduct` and pick **conduct (opus-conductor)** from t
   - Explore agents run on Haiku 5.5.
   - Any older Haiku request is lifted to Haiku 5.5.
   - An explicit Opus or Sonnet choice is kept.
-- **Autopilot:** it nudges Opus to continue, at most 8 times, while tasks are open and no worker is running. Opus can pause it to ask you a question.
+- **Autopilot:** it nudges Opus to continue, at most 8 times, while tasks are open and no worker is running. Opus can pause it to ask you a question (`wait`) or to wait on the outside world (`hold`).
+- **No nudge spam (1.5):** autopilot never asks twice for nothing.
+  - `hold`: Opus says what it waits on and, optionally, after how many minutes to check again. The band shows "on hold · 12m left" or "on hold · until a notification".
+  - Stall detection: a nudged turn that changed nothing on the board (no task moved, no agent started, no file written) puts the mission on hold for 5 min, doubling per stall in a row up to 30 min, instead of nudging again.
+  - Background work: a turn in which Opus started a background command or a monitor is held too, since its notification wakes the session.
+  - Waking: a task notification, a peer message, a scheduled trigger, or you typing resumes the mission at once. The timer wakes Opus once with "check whether it's ready; if not, hold again". The board has a "Resume now" button.
+  - Your message also resets the stall count and the autopilot budget.
 - **Session model:** run the session on Opus 5.5 for the intended split. If it isn't, the board shows a warning when Opus first hands off a task.
 
 ## Develop

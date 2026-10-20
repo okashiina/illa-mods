@@ -17,7 +17,8 @@ export type Task = {
   note: string
 }
 
-export type MissionStatus = 'running' | 'waiting' | 'done' | 'stopped'
+/** holding: Opus waits on something outside the session (a render, CI, a background command); autopilot stays quiet */
+export type MissionStatus = 'running' | 'waiting' | 'holding' | 'done' | 'stopped'
 
 export type Mission = {
   title: string
@@ -31,6 +32,18 @@ export type Mission = {
   continues: number
   note: string
   doing: string
+  /** while holding: when the fallback timer wakes Opus; 0 = only a notification or the person does */
+  holdUntil: number
+  /** when autopilot last nudged; 0 when the last turn was not its */
+  nudgedAt: number
+  /** the board's fingerprint at the last nudge: unchanged after the turn = a stall */
+  mark: string
+  /** stalls in a row: each one doubles the hold */
+  stalls: number
+  /** when Opus started a background task this turn (Bash run_in_background, Monitor); 0 otherwise */
+  pendingAt: number
+  /** main-loop write tool calls so far: part of the fingerprint */
+  writes: number
 }
 
 export type AgentStatus = 'running' | 'done' | 'failed' | 'stopped'

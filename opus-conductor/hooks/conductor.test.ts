@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { applyAction, describeCall, effortOf, newMission, progress, steerModel, taskIdIn } from './mission'
+import { applyAction, continuation, describeCall, effortOf, fingerprint, holdExpired, newMission, progress, stallHold, steerModel, taskIdIn } from './mission'
 
 const PANE = { component: 'Pane', requestId: 'opus-conductor', props: { title: 'Opus Conductor', isFocused: false, bodyColumns: 80, placement: 'dock' } as never } as const
 
@@ -134,4 +134,166 @@ test('model steering leaves every effort variant of the conductor agents alone',
   const own = { worker: 'opus-conductor:worker', scout: 'opus-conductor:scout' }
   expect(steerModel(undefined, 'opus-conductor:worker-medium', own)).toBeUndefined()
   expect(steerModel(undefined, 'opus-conductor:scout-high', own)).toBeUndefined()
+})
+
+test('"hold" pauses the mission for the outside world; board work resumes it', async () => {
+  let m = applyAction(newMission('Render the cards', 0), { action: 'plan', tasks: [{ title: 'run tests', owner: 'opus' }] }, 1).mission
+  const held = applyAction(m, { action: 'hold', note: 'T1 rendering on RunPod', minutes: 10 }, 2)
+  expect(held.mission.status).toBe('holding')
+  expect(held.mission.holdUntil).toBe(2 + 10 * 60000)
+  expect(held.text).toMatch(/End your turn now/)
+  const open = applyAction(m, { action: 'hold', note: 'waiting for the monitor' }, 2).mission
+  expect(open.holdUntil).toBe(0)
+  m = applyAction(held.mission, { action: 'done', ids: [1] }, 3).mission
+  expect(m.status).toBe('running')
+  expect(m.holdUntil).toBe(0)
+  expect(continuation(m)).toMatch(/action "hold"/)
+  expect(holdExpired(held.mission)).toMatch(/T1 rendering on RunPod/)
+  expect([1, 2, 3, 4].map(stallHold)).toEqual([5, 10, 20, 30].map(min => min * 60000))
+})
+
+test('the fingerprint moves with task status, agents and writes, not with chatter', async () => {
+  const m = applyAction(newMission('x', 0), { action: 'plan', tasks: [{ title: 'a' }, { title: 'b' }] }, 1).mission
+  const a = fingerprint(m, [])
+  expect(fingerprint({ ...m, doing: 'checking the render' }, [])).toBe(a)
+  expect(fingerprint(applyAction(m, { action: 'start', ids: [1] }, 2).mission, [])).not.toBe(a)
+  expect(fingerprint({ ...m, writes: 1 }, [])).not.toBe(a)
+  const agent = { id: 'a1', label: '', model: 'claude-sonnet-5-5', type: '', startedAt: 3, endedAt: 0, status: 'running' as const, tools: 0, doing: '', pct: 0, taskId: 1, summary: '' }
+  expect(fingerprint(m, [agent])).not.toBe(a)
+})
+
+test('autopilot nudges once, holds after a turn that changed nothing, and a notification or the timer wakes it', async ($, on) => {
+  const clock = mock.clock(on, { now: 1000 })
+  mock.store(on)
+  const submitted: string[] = []
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.status', () => ({ value: undefined }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('command.run', () => ({ text: 'brief' }))
+  on('turn.complete', (_$, e) => ({ text: e.answer }))
+  on('prompt.submit', (_$, e) => {
+    submitted.push(e.text)
+    return { text: e.text }
+  })
+  const call = (input: object) => $.tool.call({ tool: 'mcp__opus-conductor__mission', ...input } as never)
+  const turn = () => $.turn.complete({ answer: 'still rendering', durationMs: 10, isAborted: false, turnId: 't', reason: 'answer' } as never)
+  type M = { status: string; continues: number; holdUntil: number; stalls: number }
+  let latest: M | null = null
+  on('state.set', (_$, e, next) => {
+    if (e.key === 'mission') latest = e.value as M | null
+    return next(e)
+  })
+  const mission = async () => latest as M
+
+  await $.command.run({ command: 'conduct', args: 'Render the cards' } as never)
+  await call({ action: 'plan', tasks: [{ title: 'run tests', owner: 'opus' }, { title: 'QC', owner: 'opus' }] })
+  await call({ action: 'start', ids: [1] })
+
+  // an idle turn with open tasks: one nudge
+  await turn()
+  await clock.settle()
+  expect(submitted.length).toBe(1)
+  expect(submitted[0]).toMatch(/Continue the Opus Conductor mission/)
+  expect((await mission()).continues).toBe(1)
+
+  // the nudged turn changed nothing on the board: a hold, no second nudge
+  await turn()
+  await clock.settle()
+  expect(submitted.length).toBe(1)
+  expect((await mission()).status).toBe('holding')
+  expect((await mission()).stalls).toBe(1)
+  expect((await mission()).holdUntil).toBe(clock.now() + 5 * 60000)
+
+  // more idle turns while holding stay silent
+  await turn()
+  await clock.settle()
+  expect(submitted.length).toBe(1)
+
+  // the pane says so
+  const ui = await $.ui.mount({ plugin: 'opus-conductor', surface: 'terminal', ...PANE })
+  expect(await ui.find({ type: 'Text', text: /On hold/ })).toBeDefined()
+  expect(await ui.find({ key: 'conduct-resume' })).toBeDefined()
+  await ui.unmount()
+
+  // a task notification (the render finished) wakes it without a nudge
+  await $.prompt.submit({ text: 'Background task done', wait: false, origin: { kind: 'task-notification' } } as never)
+  expect((await mission()).status).toBe('running')
+  expect((await mission()).holdUntil).toBe(0)
+  expect(submitted.length).toBe(2)
+
+  // a second stall holds twice as long; the timer then wakes Opus once
+  await turn()
+  await clock.settle()
+  expect(submitted.length).toBe(3)
+  await turn()
+  await clock.settle()
+  expect((await mission()).status).toBe('holding')
+  expect((await mission()).stalls).toBe(2)
+  const until = (await mission()).holdUntil
+  expect(until).toBe(clock.now() + 10 * 60000)
+  await clock.advance(10 * 60000 - 1)
+  expect(submitted.length).toBe(3)
+  await clock.advance(1)
+  expect((await mission()).status).toBe('running')
+  expect(submitted.length).toBe(4)
+  expect(submitted[3]).toMatch(/hold on the Opus Conductor mission .* ran out/)
+
+  // still nothing after the wake: a longer hold at once, no nudge in between
+  await turn()
+  await clock.settle()
+  expect(submitted.length).toBe(4)
+  expect((await mission()).status).toBe('holding')
+  expect((await mission()).stalls).toBe(3)
+  expect((await mission()).holdUntil).toBe(clock.now() + 20 * 60000)
+
+  // the person speaking resets the stall count and the autopilot budget
+  await $.prompt.submit({ text: 'go on', wait: false, origin: { kind: 'composer' } } as never)
+  expect((await mission()).stalls).toBe(0)
+  expect((await mission()).continues).toBe(0)
+})
+
+test('an explicit "hold" with a timer wakes Opus when it runs out; a background task holds without a nudge', async ($, on) => {
+  const clock = mock.clock(on, { now: 1000 })
+  mock.store(on)
+  const submitted: string[] = []
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.status', () => ({ value: undefined }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('command.run', () => ({ text: 'brief' }))
+  on('turn.complete', (_$, e) => ({ text: e.answer }))
+  on('tool.call', () => ({ result: 'started' }))
+  on('prompt.submit', (_$, e) => {
+    submitted.push(e.text)
+    return { text: e.text }
+  })
+  const call = (input: object) => $.tool.call({ tool: 'mcp__opus-conductor__mission', ...input } as never)
+  const turn = () => $.turn.complete({ answer: 'waiting', durationMs: 10, isAborted: false, turnId: 't', reason: 'answer' } as never)
+  type M = { status: string; holdUntil: number; note: string }
+  let latest: M | null = null
+  on('state.set', (_$, e, next) => {
+    if (e.key === 'mission') latest = e.value as M | null
+    return next(e)
+  })
+  const mission = async () => latest as M
+
+  await $.command.run({ command: 'conduct', args: 'Render the cards' } as never)
+  await call({ action: 'plan', tasks: [{ title: 'run tests', owner: 'opus' }] })
+  await call({ action: 'hold', note: 'T1 rendering', minutes: 3 })
+  await turn()
+  await clock.settle()
+  expect(submitted.length).toBe(0)
+  expect((await mission()).status).toBe('holding')
+  await clock.advance(3 * 60000)
+  expect((await mission()).status).toBe('running')
+  expect(submitted.length).toBe(1)
+  expect(submitted[0]).toMatch(/T1 rendering/)
+
+  // Opus starts a background command: its notification will wake the session, so no nudge
+  await $.tool.call({ tool: 'Bash', command: 'python render.py', run_in_background: true } as never)
+  await turn()
+  await clock.settle()
+  expect(submitted.length).toBe(1)
+  expect((await mission()).status).toBe('holding')
+  expect((await mission()).note).toMatch(/background task/)
+  expect((await mission()).holdUntil).toBe(clock.now() + 15 * 60000)
 })

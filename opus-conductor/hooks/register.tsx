@@ -11,12 +11,17 @@
 //   a status line show the same in short.
 // - Autopilot: while the mission is unfinished and no worker is running, an
 //   ended turn is followed by a "continue" prompt (at most maxContinues times).
+//   It stays quiet while the mission is on hold: Opus called "hold" because it
+//   waits on something outside the session, a nudged turn changed nothing on
+//   the board (a stall), or Opus started a background task. A task
+//   notification, the person, or a fallback timer wakes it.
 
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, Register } from 'claude-code'
 
 import type { AgentRow, Mission, ConductorSettings, Task } from '../types'
 import {
+  BACKGROUND_HOLD,
   HAIKU,
   SCOUT,
   SCOUT_EFFORTS,
@@ -30,13 +35,18 @@ import {
   describeCall,
   effortOf,
   eta,
+  fingerprint,
+  holdExpired,
   isStopWord,
+  isWriteTool,
   minutes,
   missionToolSpec,
   newMission,
   progress,
   reportToolSpec,
   scoutPrompt,
+  stallHold,
+  startsBackgroundWork,
   steerModel,
   taskIdIn,
   workerPrompt,
@@ -69,7 +79,7 @@ type $ = EngineInterface
 type Kit = Elements[keyof Elements]
 
 function isLive(m: Mission | null): m is Mission {
-  return !!m && (m.status === 'running' || m.status === 'waiting')
+  return !!m && (m.status === 'running' || m.status === 'waiting' || m.status === 'holding')
 }
 
 async function sync($: $) {
@@ -78,7 +88,7 @@ async function sync($: $) {
   const running = agents.filter(a => a.status === 'running').length
   if (isLive(m)) {
     const p = progress(m, agents)
-    const word = m.status === 'waiting' ? 'waiting on you' : m.planAt ? `${p.pct}%` : 'planning'
+    const word = m.status === 'waiting' ? 'waiting on you' : m.status === 'holding' ? 'on hold' : m.planAt ? `${p.pct}%` : 'planning'
     $.ui.status(`◆ conduct ${word}${running ? ` · ${running} agent${running > 1 ? 's' : ''}` : ''}`)
   } else if (running) {
     $.ui.status(`◆ ${running} agent${running > 1 ? 's' : ''} running`)
@@ -99,6 +109,39 @@ async function setAgents($: $, fn: (list: AgentRow[]) => AgentRow[]) {
 
 async function openPane($: $) {
   await $.ui.open({ id: PANE, title: 'Opus Conductor' })
+}
+
+// the fallback timer of the current hold; a hot reload drops it, session.start re-arms it
+let holdTimer: { cancel: () => void } | null = null
+
+function dropHoldTimer() {
+  holdTimer?.cancel()
+  holdTimer = null
+}
+
+/** Arms the hold's timer: when it runs out and the hold still stands, Opus is woken once. */
+async function armHold($: $) {
+  dropHoldTimer()
+  const m = await read($, missionAtom)
+  if (!m || m.status !== 'holding' || !m.holdUntil) return
+  const now = await $.clock.now()
+  const until = m.holdUntil
+  holdTimer = $.clock.after(Math.max(0, until - now), async () => {
+    holdTimer = null
+    const cur = await read($, missionAtom)
+    if (!cur || cur.status !== 'holding' || cur.holdUntil !== until) return
+    // the wake counts as a nudge: a turn that again changes nothing holds longer, with no nudge between
+    const at = await $.clock.now()
+    const mark = fingerprint(cur, await read($, agentsAtom))
+    await setMission($, x => (x ? { ...x, status: 'running', holdUntil: 0, nudgedAt: at, mark, doing: 'hold ran out; checking' } : x))
+    void $.prompt.submit({ text: holdExpired(cur) })
+  })
+}
+
+/** Puts the mission on hold from the hook side, with a fallback timer. */
+async function hold($: $, now: number, ms: number, note: string, stalls: number) {
+  await setMission($, x => (x ? { ...x, status: 'holding', holdUntil: now + ms, note, stalls, nudgedAt: 0, pendingAt: 0, doing: `on hold: ${note}` } : x))
+  await armHold($)
 }
 
 export const register: Register = on => {
@@ -151,6 +194,7 @@ export const register: Register = on => {
         if (isLive(m)) $.ui.invalidate('ui.render')
       })
     })
+    await armHold($)
     await sync($)
 
     return next(e)
@@ -192,9 +236,18 @@ export const register: Register = on => {
   })
 
   on('prompt.submit', async ($, e, next) => {
-    // the person speaking resumes a waiting mission and refills the autopilot
-    if (e.origin.kind === 'composer') {
-      await setMission($, m => (isLive(m) ? { ...m, status: 'running', continues: 0 } : m))
+    const kind = e.origin.kind
+    if (kind === 'composer' || kind === 'bridge') {
+      // the person speaking resumes a waiting or held mission and refills the autopilot
+      await setMission($, m => (isLive(m) ? { ...m, status: 'running', continues: 0, stalls: 0, holdUntil: 0, nudgedAt: 0, pendingAt: 0 } : m))
+      dropHoldTimer()
+    } else if (kind !== 'plugin') {
+      // what Opus waited for arrived (a task notification, a peer, a schedule): the hold is over
+      const m = await read($, missionAtom)
+      if (isLive(m) && (m.status === 'holding' || m.pendingAt)) {
+        await setMission($, x => (x ? { ...x, status: x.status === 'holding' ? 'running' : x.status, holdUntil: 0, nudgedAt: 0, pendingAt: 0, doing: `woken by a ${kind}` } : x))
+        dropHoldTimer()
+      }
     }
     return next(e)
   })
@@ -221,7 +274,13 @@ export const register: Register = on => {
         reply = r.text
         return r.mission
       })
-      if ((await read($, missionAtom))?.status === 'done') $.ui.toast('◆ Mission complete')
+      const after = await read($, missionAtom)
+      if (after?.status === 'done') $.ui.toast('◆ Mission complete')
+      if (after?.status === 'holding') {
+        await armHold($)
+      } else {
+        dropHoldTimer()
+      }
       return { result: reply }
     }
 
@@ -237,9 +296,13 @@ export const register: Register = on => {
       const id = e.agentId
       const known = (await read($, agentsAtom)).some(a => a.id === id)
       if (known) await setAgents($, list => list.map(a => (a.id === id ? { ...a, tools: a.tools + 1, doing } : a)))
-    } else if (e.tool !== 'Agent') {
+    } else {
       const m = await read($, missionAtom)
-      if (isLive(m)) await setMission($, x => (x ? { ...x, doing } : x))
+      if (isLive(m)) {
+        const writes = isWriteTool(String(e.tool)) ? 1 : 0
+        const background = startsBackgroundWork(String(e.tool), input)
+        await setMission($, x => (x ? { ...x, writes: x.writes + writes, ...(background ? { pendingAt: now } : {}), ...(e.tool === 'Agent' ? {} : { doing }) } : x))
+      }
     }
 
     return next(e)
@@ -305,6 +368,7 @@ export const register: Register = on => {
     }
 
     const m = await read($, missionAtom)
+    // waiting on the person or on hold: autopilot stays quiet
     if (!m || m.status !== 'running') return r
     const agents = await read($, agentsAtom)
     const p = progress(m, agents)
@@ -314,14 +378,33 @@ export const register: Register = on => {
       return r
     }
 
-    // Autopilot: a running worker wakes Opus with its notification; otherwise nudge.
     const settings = await read($, settingsAtom)
     const working = agents.some(a => a.status === 'running')
+
+    // Opus started a background task this turn: its notification wakes the session, not a nudge.
+    if (!working && m.pendingAt > 0) {
+      await hold($, now, BACKGROUND_HOLD, 'a background task Opus started', 0)
+      return r
+    }
+    // A nudged turn that changed nothing on the board is a stall: hold, longer each stall
+    // in a row, instead of asking again. A nudged turn that moved the board clears the count.
+    const mark = fingerprint(m, agents)
+    const nudged = m.nudgedAt > 0
+    if (!working && nudged && mark === m.mark) {
+      const stalls = m.stalls + 1
+      const ms = stallHold(stalls)
+      await hold($, now, ms, `no progress after the last nudge (${stalls})`, stalls)
+      $.ui.toast(`◆ Autopilot on hold ${minutes(ms)}: the last nudge changed nothing`)
+      return r
+    }
+    const stalls = nudged ? 0 : m.stalls
+
+    // Autopilot: a running worker wakes Opus with its notification; otherwise nudge.
     if (settings.auto && e.reason === 'answer' && !e.isAborted && !working && m.continues < settings.maxContinues) {
-      await setMission($, x => (x ? { ...x, continues: x.continues + 1, doing: 'continuing (autopilot)' } : x))
+      await setMission($, x => (x ? { ...x, continues: x.continues + 1, nudgedAt: now, mark, stalls, doing: 'continuing (autopilot)' } : x))
       void $.prompt.submit({ text: continuation(m) })
     } else {
-      await setMission($, x => (x ? { ...x, doing: working ? 'waiting on workers' : 'idle' } : x))
+      await setMission($, x => (x ? { ...x, nudgedAt: 0, stalls, doing: working ? 'waiting on workers' : 'idle' } : x))
     }
     return r
   })
@@ -350,8 +433,8 @@ export const register: Register = on => {
     const p = progress(m, agents)
     const running = agents.filter(a => a.status === 'running')
     const width = Math.max(30, e.props.bodyColumns || 80)
-    const tone = m.status === 'done' ? COLOR.done : m.status === 'waiting' ? COLOR.wait : COLOR.opus
-    const right = m.status === 'done' ? 'done ✓' : m.status === 'waiting' ? 'waiting on you' : m.planAt ? `${p.pct}%` : 'planning…'
+    const tone = m.status === 'done' ? COLOR.done : m.status === 'waiting' || m.status === 'holding' ? COLOR.wait : COLOR.opus
+    const right = m.status === 'done' ? 'done ✓' : m.status === 'waiting' ? 'waiting on you' : m.status === 'holding' ? holdWord(m, now) : m.planAt ? `${p.pct}%` : 'planning…'
 
     return (
       <Box flexDirection="column">
@@ -378,6 +461,11 @@ export const register: Register = on => {
 }
 
 // ---------- pieces ----------
+
+/** "on hold · 12m left" or "on hold · until a notification" */
+function holdWord(m: Mission, now: number): string {
+  return m.holdUntil ? `on hold · ${minutes(Math.max(0, m.holdUntil - now))} left` : 'on hold · until a notification'
+}
 
 function modelName(id: string): string {
   const hit = /(opus|sonnet|haiku|fable)[-_ ]?(\d+)?(?:[-.](\d+))?/i.exec(id)
@@ -461,15 +549,26 @@ function drawPane($: EngineInterface, table: Kit, v: View) {
     }
     const p = progress(m, agents)
     const left = eta(m, agents, now)
-    const tone = m.status === 'done' ? COLOR.done : m.status === 'waiting' ? COLOR.wait : m.status === 'stopped' ? COLOR.track : COLOR.opus
+    const tone = m.status === 'done' ? COLOR.done : m.status === 'waiting' || m.status === 'holding' ? COLOR.wait : m.status === 'stopped' ? COLOR.track : COLOR.opus
     const word =
-      m.status === 'done' ? `Done ✓ in ${minutes(m.endedAt - m.startedAt)}` : m.status === 'stopped' ? 'Stopped' : m.status === 'waiting' ? 'Waiting on you' : m.planAt ? `${p.doneN} of ${p.n} tasks done` : 'Planning…'
+      m.status === 'done'
+        ? `Done ✓ in ${minutes(m.endedAt - m.startedAt)}`
+        : m.status === 'stopped'
+          ? 'Stopped'
+          : m.status === 'waiting'
+            ? 'Waiting on you'
+            : m.status === 'holding'
+              ? `On hold · ${p.doneN} of ${p.n} tasks done`
+              : m.planAt
+                ? `${p.doneN} of ${p.n} tasks done`
+                : 'Planning…'
+    const live = isLive(m)
     const meta = [
-      m.status === 'running' || m.status === 'waiting' ? `⏱ ${minutes(now - m.startedAt)}` : '',
+      live ? `⏱ ${minutes(now - m.startedAt)}` : '',
       left !== null ? `~${minutes(left)} left` : '',
+      m.status === 'holding' ? (m.holdUntil ? `wakes in ${minutes(Math.max(0, m.holdUntil - now))}` : 'wakes on a notification') : '',
       settings.auto ? `autopilot ${m.continues}/${settings.maxContinues}` : 'autopilot off',
     ].filter(Boolean)
-    const live = m.status === 'running' || m.status === 'waiting'
     return (
       <Box flexDirection="column" rowGap={0}>
         <Box flexDirection="row" columnGap={2} alignItems="center">
@@ -490,7 +589,7 @@ function drawPane($: EngineInterface, table: Kit, v: View) {
         {live && (
           <Text wrap="truncate-end">
             <Text color={COLOR.opus} bold>Opus 5.5 </Text>
-            <Text dimColor>{m.status === 'waiting' ? `asks: ${m.note}` : m.doing}</Text>
+            <Text dimColor>{m.status === 'waiting' ? `asks: ${m.note}` : m.status === 'holding' ? `holds: ${m.note}` : m.doing}</Text>
           </Text>
         )}
       </Box>
@@ -563,7 +662,7 @@ function drawPane($: EngineInterface, table: Kit, v: View) {
     return { hiddenDone, rows }
   })()
 
-  const live = !!m && (m.status === 'running' || m.status === 'waiting')
+  const live = isLive(m)
 
   return (
     <Box flexDirection="column" rowGap={1}>
@@ -591,6 +690,16 @@ function drawPane($: EngineInterface, table: Kit, v: View) {
             onPress={async () => {
               const at = await $.clock.now()
               await update($, missionAtom, x => (x ? { ...x, status: 'stopped' as const, endedAt: at } : x))
+            }}
+          />
+        )}
+        {m?.status === 'holding' && (
+          <Button
+            key="conduct-resume"
+            label="Resume now"
+            onPress={async () => {
+              const cur = await update($, missionAtom, x => (x ? { ...x, status: 'running' as const, holdUntil: 0, nudgedAt: 0, pendingAt: 0, doing: 'resumed by you' } : x))
+              if (cur) void $.prompt.submit({ text: holdExpired(cur) })
             }}
           />
         )}

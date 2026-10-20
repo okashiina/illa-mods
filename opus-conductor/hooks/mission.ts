@@ -57,7 +57,45 @@ export function newMission(condition: string, now: number): Mission {
     continues: 0,
     note: '',
     doing: 'reading the ask',
+    holdUntil: 0,
+    nudgedAt: 0,
+    mark: '',
+    stalls: 0,
+    pendingAt: 0,
+    writes: 0,
   }
+}
+
+const MIN = 60000
+/** a stall's hold: 5 min, doubling each stall in a row, at most 30 min */
+export function stallHold(stalls: number): number {
+  return Math.min(30, 5 * 2 ** Math.max(0, stalls - 1)) * MIN
+}
+/** how long a background task may take before the fallback timer asks Opus to look */
+export const BACKGROUND_HOLD = 15 * MIN
+
+/** What the board looks like: unchanged across a nudged turn means the nudge did nothing. */
+export function fingerprint(m: Mission, agents: readonly AgentRow[]): string {
+  const tasks = m.tasks.map(t => `${t.id}${t.status[0]}`).join('')
+  const rows = agents.map(a => `${a.id}${a.status[0]}`).join('')
+  return `${tasks}|${rows}|${m.writes}`
+}
+
+/** tools whose call is progress in itself, nudge or not */
+export function isWriteTool(tool: string): boolean {
+  return /^(Edit|MultiEdit|Write|NotebookEdit|Agent)$/.test(tool)
+}
+
+/** a tool call that starts work the session hears about later, as a task notification */
+export function startsBackgroundWork(tool: string, input: Record<string, unknown>): boolean {
+  if (tool === 'Monitor' || tool === 'ScheduleWakeup') return true
+  return (tool === 'Bash' || tool === 'PowerShell') && input.run_in_background === true
+}
+
+function resume(m: Mission) {
+  if (m.status === 'waiting' || m.status === 'holding') m.status = 'running'
+  m.holdUntil = 0
+  m.pendingAt = 0
 }
 
 type RawTask = { title?: unknown; size?: unknown; owner?: unknown; effort?: unknown }
@@ -106,6 +144,7 @@ export type MissionInput = {
   tasks?: unknown
   ids?: unknown
   note?: unknown
+  minutes?: unknown
 }
 
 function idsOf(raw: unknown): number[] {
@@ -131,6 +170,7 @@ export function applyAction(
     m.tasks.push(...added)
     if (!m.planAt) m.planAt = now
     m.doing = 'planned; dispatching'
+    resume(m)
     return { mission: m, text: `${action === 'plan' ? 'Plan set' : 'Added'}: ${added.map(t => `#${t.id} ${t.title} (${t.size}, ${t.owner})`).join('; ')}.\n${summary(m)}` }
   }
 
@@ -150,14 +190,26 @@ export function applyAction(
       }
       if (note) t.note = note
     }
-    if (m.status === 'waiting') m.status = 'running'
+    resume(m)
     return { mission: m, text: summary(m) }
   }
 
   if (action === 'wait') {
     m.status = 'waiting'
     m.note = note || 'waiting on the person'
+    m.holdUntil = 0
     return { mission: m, text: 'Mission paused for the person. Autopilot will not continue until they reply.' }
+  }
+
+  if (action === 'hold') {
+    const mins = Math.max(0, Math.min(24 * 60, Number(input.minutes) || 0))
+    m.status = 'holding'
+    m.note = note || 'waiting on something outside this session'
+    m.holdUntil = mins ? now + mins * MIN : 0
+    m.pendingAt = 0
+    m.doing = `on hold: ${m.note}`
+    const wake = mins ? `in ${mins} min` : 'only when a notification arrives'
+    return { mission: m, text: `On hold: ${m.note}. Autopilot stays quiet; a task notification, the person, or the timer (${wake}) wakes you. End your turn now without further checks.` }
   }
 
   if (action === 'complete') {
@@ -262,11 +314,13 @@ export function missionToolSpec(name: string) {
       'Opus Conductor mission board: the plan the person watches live. Actions: ' +
       '"plan" (replace pending tasks) / "add" with tasks [{ title, size: S|M|L, owner: "opus"|"sonnet"|"haiku", effort: "low"|"medium"|"high"|"xhigh" }]; ' +
       '"start" / "done" / "drop" with ids [n] and an optional note; "wait" with a note when you need the person; ' +
+      '"hold" with a note (and optional minutes) when you are waiting on something outside this session (a render, CI, a background command, a monitor): ' +
+      'autopilot stays quiet until a task notification, the person, or the timer wakes you; ' +
       '"complete" with a note once the whole mission is verified; "show". Mark a task done only after you verified its result.',
     inputSchema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['plan', 'add', 'start', 'done', 'drop', 'wait', 'complete', 'show'] },
+        action: { type: 'string', enum: ['plan', 'add', 'start', 'done', 'drop', 'wait', 'hold', 'complete', 'show'] },
         tasks: {
           type: 'array',
           items: {
@@ -282,6 +336,7 @@ export function missionToolSpec(name: string) {
         },
         ids: { type: 'array', items: { type: 'integer' } },
         note: { type: 'string' },
+        minutes: { type: 'number', minimum: 1, description: 'for "hold": wake me after this many minutes if nothing else does' },
       },
       required: ['action'],
     },
@@ -328,5 +383,10 @@ Rules:
 export function continuation(m: Mission): string {
   const open = live(m).filter(t => t.status !== 'done')
   if (!m.planAt) return `Continue the Opus Conductor mission "${m.title}": make the plan with the mission tool first, then delegate.`
-  return `Continue the Opus Conductor mission "${m.title}". Open tasks: ${open.map(t => `#${t.id} ${t.title} [${t.status}, ${t.owner}]`).join('; ')}. Delegate, verify, integrate and update the board. If you need the person, call the mission tool with action "wait".`
+  return `Continue the Opus Conductor mission "${m.title}". Open tasks: ${open.map(t => `#${t.id} ${t.title} [${t.status}, ${t.owner}]`).join('; ')}. Delegate, verify, integrate and update the board. If you need the person, call the mission tool with action "wait". If you are waiting on something outside this session (a render, CI, a background command, a monitor), call it with action "hold" and end the turn; never answer with a status update alone.`
+}
+
+/** The prompt that wakes Opus when a hold's timer runs out. */
+export function holdExpired(m: Mission): string {
+  return `The hold on the Opus Conductor mission "${m.title}" ran out (${m.note}). Check once whether what you were waiting on is ready. If it is, continue the mission; if not, call the mission tool with action "hold" again, with a longer timer, and end the turn.`
 }
