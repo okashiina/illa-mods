@@ -207,7 +207,7 @@ export function applyAction(
     m.note = note || 'waiting on something outside this session'
     m.holdUntil = mins ? now + mins * MIN : 0
     m.pendingAt = 0
-    m.doing = `on hold: ${m.note}`
+    m.doing = `cooking: ${m.note}`
     const wake = mins ? `in ${mins} min` : 'only when a notification arrives'
     return { mission: m, text: `On hold: ${m.note}. Autopilot stays quiet; a task notification, the person, or the timer (${wake}) wakes you. End your turn now without further checks.` }
   }
@@ -233,27 +233,54 @@ export function live(m: Mission): Task[] {
   return m.tasks.filter(t => t.status !== 'dropped')
 }
 
-/** Finished weight over the plan's weight; an active task counts its worker's reported %. */
+/**
+ * An agent's live %: its own report, creeping up with each tool call since, or,
+ * before its first report, an estimate from the tool calls it has made.
+ * Never 100 until it hands back.
+ */
+export function agentPct(a: AgentRow): number {
+  if (a.status === 'done') return 100
+  if (a.pct > 0) return Math.min(95, Math.round(a.pct + Math.min(15, Math.max(0, a.tools - (a.pctTools ?? a.tools)) * 1.5)))
+  return Math.round(75 * (1 - Math.exp(-a.tools / 30)))
+}
+
+/** Finished weight over the plan's weight; an active task counts its agent's live %. */
 export function progress(m: Mission, agents: readonly AgentRow[] = []) {
   const tasks = live(m)
   const total = tasks.reduce((a, t) => a + SIZES[t.size], 0)
   let done = 0
   for (const t of tasks) {
     if (t.status === 'done') done += SIZES[t.size]
-    else if (t.status === 'active') {
-      const a = agents.find(x => x.taskId === t.id && x.status === 'running' && x.pct > 0)
-      if (a) done += SIZES[t.size] * Math.min(0.9, a.pct / 100)
-    }
+    else if (t.status === 'active') done += SIZES[t.size] * taskFraction(t, agents)
   }
   const doneN = tasks.filter(t => t.status === 'done').length
   const fraction = m.status === 'done' ? 1 : total ? done / total : 0
   return { n: tasks.length, doneN, fraction, pct: Math.round(fraction * 100) }
 }
 
+/** How far an active task is: its running agent's live % (at most 90%), 90% once its agent handed back. */
+export function taskFraction(t: Task, agents: readonly AgentRow[]): number {
+  const mine = agents.filter(x => x.taskId === t.id && x.status !== 'failed' && x.status !== 'stopped')
+  if (!mine.length) return 0
+  return Math.min(0.9, Math.max(...mine.map(a => agentPct(a) / 100)))
+}
+
+/**
+ * What the mission is doing, in the board's words. A hold is "cooking" whenever
+ * work goes on: agents running, a background task, or the outside job Opus
+ * waits on. Only a stall with nothing running is "standing by".
+ */
+export function phase(m: Mission, agents: readonly AgentRow[]): 'planning' | 'cooking' | 'standby' | 'waiting' | 'done' | 'stopped' {
+  if (m.status === 'done' || m.status === 'stopped' || m.status === 'waiting') return m.status
+  const working = agents.some(a => a.status === 'running')
+  if (m.status === 'holding' && m.stalls > 0 && !working) return 'standby'
+  return m.planAt || working ? 'cooking' : 'planning'
+}
+
 /** Time left at the mission's own pace, once a quarter of it is done. */
 export function eta(m: Mission, agents: readonly AgentRow[], now: number): number | null {
   const p = progress(m, agents)
-  if (m.status !== 'running' || !m.planAt || p.fraction < 0.25 || p.fraction >= 1) return null
+  if ((m.status !== 'running' && m.status !== 'holding') || !m.planAt || p.fraction < 0.25 || p.fraction >= 1) return null
   const spent = now - m.planAt
   return (spent / p.fraction) * (1 - p.fraction)
 }

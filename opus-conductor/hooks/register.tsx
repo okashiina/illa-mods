@@ -11,10 +11,11 @@
 //   a status line show the same in short.
 // - Autopilot: while the mission is unfinished and no worker is running, an
 //   ended turn is followed by a "continue" prompt (at most maxContinues times).
-//   It stays quiet while the mission is on hold: Opus called "hold" because it
+//   It stays quiet while the mission holds: Opus called "hold" because it
 //   waits on something outside the session, a nudged turn changed nothing on
 //   the board (a stall), or Opus started a background task. A task
-//   notification, the person, or a fallback timer wakes it.
+//   notification, the person, or a fallback timer wakes it. The board calls a
+//   hold "cooking" while work goes on, and "standing by" only for a stall.
 
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, Register } from 'claude-code'
@@ -27,6 +28,7 @@ import {
   SCOUT_EFFORTS,
   SONNET,
   WORKER,
+  agentPct,
   WORKER_EFFORTS,
   agentName,
   applyAction,
@@ -42,12 +44,14 @@ import {
   minutes,
   missionToolSpec,
   newMission,
+  phase,
   progress,
   reportToolSpec,
   scoutPrompt,
   stallHold,
   startsBackgroundWork,
   steerModel,
+  taskFraction,
   taskIdIn,
   workerPrompt,
 } from './mission'
@@ -73,6 +77,13 @@ const SCOUT_USE: Record<string, string> = {
   high: 'careful cross-checking, browser flows, sweeps where a wrong answer is costly',
 }
 
+const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+
+/** a spinner frame that turns with the clock: the board ticks every second while cooking */
+function spin(now: number): string {
+  return SPIN[Math.floor(now / 1000) % SPIN.length] ?? '⠋'
+}
+
 const COLOR = { opus: '#D97757', sonnet: '#6A9BCC', haiku: '#3FB8AF', done: '#3FB950', wait: '#D29922', fail: '#F85149', track: '#8B949E' }
 
 type $ = EngineInterface
@@ -88,7 +99,8 @@ async function sync($: $) {
   const running = agents.filter(a => a.status === 'running').length
   if (isLive(m)) {
     const p = progress(m, agents)
-    const word = m.status === 'waiting' ? 'waiting on you' : m.status === 'holding' ? 'on hold' : m.planAt ? `${p.pct}%` : 'planning'
+    const ph = phase(m, agents)
+    const word = ph === 'waiting' ? 'waiting on you' : ph === 'standby' ? 'standing by' : ph === 'planning' ? 'planning' : `cooking ${p.pct}%`
     $.ui.status(`◆ conduct ${word}${running ? ` · ${running} agent${running > 1 ? 's' : ''}` : ''}`)
   } else if (running) {
     $.ui.status(`◆ ${running} agent${running > 1 ? 's' : ''} running`)
@@ -140,7 +152,7 @@ async function armHold($: $) {
 
 /** Puts the mission on hold from the hook side, with a fallback timer. */
 async function hold($: $, now: number, ms: number, note: string, stalls: number) {
-  await setMission($, x => (x ? { ...x, status: 'holding', holdUntil: now + ms, note, stalls, nudgedAt: 0, pendingAt: 0, doing: `on hold: ${note}` } : x))
+  await setMission($, x => (x ? { ...x, status: 'holding', holdUntil: now + ms, note, stalls, nudgedAt: 0, pendingAt: 0, doing: stalls ? `standing by: ${note}` : `cooking: ${note}` } : x))
   await armHold($)
 }
 
@@ -188,10 +200,13 @@ export const register: Register = on => {
         $.ui.log(`opus-conductor: scout-${effort} did not register (${String(err)})`)
       }
     }
-    // elapsed times and ETAs move while nothing is written
-    $.clock.every(5000, () => {
-      void read($, missionAtom).then(m => {
-        if (isLive(m)) $.ui.invalidate('ui.render')
+    // elapsed times, ETAs and the spinner move while nothing is written:
+    // every second while cooking, every 5 s otherwise
+    let ticks = 0
+    $.clock.every(1000, () => {
+      ticks++
+      void Promise.all([read($, missionAtom), read($, agentsAtom)]).then(([m, agents]) => {
+        if (isLive(m) && (phase(m, agents) === 'cooking' || ticks % 5 === 0)) $.ui.invalidate('ui.render')
       })
     })
     await armHold($)
@@ -287,7 +302,7 @@ export const register: Register = on => {
     if (e.tool === reportTool) {
       if (!e.agentId) return { result: 'Only delegated workers report progress; Opus updates the board with the mission tool.' }
       const pct = Math.max(0, Math.min(100, Math.round(Number(input.pct) || 0)))
-      await setAgents($, list => list.map(a => (a.id === e.agentId ? { ...a, pct, doing: clip(input.doing, 90) || a.doing } : a)))
+      await setAgents($, list => list.map(a => (a.id === e.agentId ? { ...a, pct, pctTools: a.tools, doing: clip(input.doing, 90) || a.doing } : a)))
       return { result: 'Reported.' }
     }
 
@@ -394,7 +409,7 @@ export const register: Register = on => {
       const stalls = m.stalls + 1
       const ms = stallHold(stalls)
       await hold($, now, ms, `no progress after the last nudge (${stalls})`, stalls)
-      $.ui.toast(`◆ Autopilot on hold ${minutes(ms)}: the last nudge changed nothing`)
+      $.ui.toast(`◆ Autopilot standing by ${minutes(ms)}: the last nudge changed nothing`)
       return r
     }
     const stalls = nudged ? 0 : m.stalls
@@ -433,8 +448,18 @@ export const register: Register = on => {
     const p = progress(m, agents)
     const running = agents.filter(a => a.status === 'running')
     const width = Math.max(30, e.props.bodyColumns || 80)
-    const tone = m.status === 'done' ? COLOR.done : m.status === 'waiting' || m.status === 'holding' ? COLOR.wait : COLOR.opus
-    const right = m.status === 'done' ? 'done ✓' : m.status === 'waiting' ? 'waiting on you' : m.status === 'holding' ? holdWord(m, now) : m.planAt ? `${p.pct}%` : 'planning…'
+    const ph = phase(m, agents)
+    const tone = ph === 'done' ? COLOR.done : ph === 'waiting' || ph === 'standby' ? COLOR.wait : COLOR.opus
+    const right =
+      ph === 'done'
+        ? 'done ✓'
+        : ph === 'waiting'
+          ? 'waiting on you'
+          : ph === 'standby'
+            ? standbyWord(m, now)
+            : ph === 'planning'
+              ? `${spin(now)} planning…`
+              : `${spin(now)} cooking · ${p.pct}%${running.length ? ` · ${running.length} agent${running.length > 1 ? 's' : ''}` : ''}`
 
     return (
       <Box flexDirection="column">
@@ -451,7 +476,7 @@ export const register: Register = on => {
         {m.planAt > 0 && <Text color={tone}>{textBar(p.fraction, Math.min(width - 2, 80))}</Text>}
         <Text dimColor wrap="truncate-end">
           {running.length
-            ? running.map(a => `${modelName(a.model)} ${a.pct ? a.pct + '% ' : ''}· ${a.doing}`).join('  |  ')
+            ? running.map(a => `${modelName(a.model)} ${pctLabel(a)} · ${a.doing}`).join('  |  ')
             : `Opus: ${m.doing}`}
         </Text>
         {below}
@@ -462,9 +487,14 @@ export const register: Register = on => {
 
 // ---------- pieces ----------
 
-/** "on hold · 12m left" or "on hold · until a notification" */
-function holdWord(m: Mission, now: number): string {
-  return m.holdUntil ? `on hold · ${minutes(Math.max(0, m.holdUntil - now))} left` : 'on hold · until a notification'
+/** "standing by · 12m left" or "standing by · until a notification" */
+function standbyWord(m: Mission, now: number): string {
+  return m.holdUntil ? `standing by · ${minutes(Math.max(0, m.holdUntil - now))} left` : 'standing by · until a notification'
+}
+
+/** "40%" when the agent reported, "~14%" while it's an estimate from its tool calls */
+function pctLabel(a: AgentRow): string {
+  return `${a.pct > 0 ? '' : '~'}${agentPct(a)}%`
 }
 
 function modelName(id: string): string {
@@ -506,20 +536,31 @@ function barSvg(fraction: number, color: string, width: number): string {
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="8" viewBox="0 0 ${width} 8"><rect width="${width}" height="8" rx="4" fill="${COLOR.track}" fill-opacity="0.25"/><rect width="${(f * width).toFixed(1)}" height="8" rx="4" fill="${color}"/></svg>`
 }
 
-/** One segment per live task, colored by where it stands: the plan at a glance. */
-function segmentsSvg(tasks: readonly Task[], width: number): string {
+/** One segment per live task, colored by where it stands; an active one fills with its agent's %. */
+function segmentsSvg(tasks: readonly Task[], agents: readonly AgentRow[], width: number): string {
   const live = tasks.filter(t => t.status !== 'dropped')
   if (!live.length) return barSvg(0, COLOR.track, width)
   const gap = 3
   const w = (width - gap * (live.length - 1)) / live.length
   const rects = live
     .map((t, i) => {
-      const color = t.status === 'done' ? COLOR.done : t.status === 'active' ? ownerColor(t.owner) : COLOR.track
-      const opacity = t.status === 'pending' ? 0.3 : 1
-      return `<rect x="${(i * (w + gap)).toFixed(1)}" width="${Math.max(2, w).toFixed(1)}" height="6" rx="3" fill="${color}" fill-opacity="${opacity}"/>`
+      const x = (i * (w + gap)).toFixed(1)
+      const seg = (fill: string, opacity: number, len: number) => `<rect x="${x}" width="${Math.max(2, len).toFixed(1)}" height="6" rx="3" fill="${fill}" fill-opacity="${opacity}"/>`
+      if (t.status === 'done') return seg(COLOR.done, 1, w)
+      if (t.status !== 'active') return seg(COLOR.track, 0.3, w)
+      const f = Math.max(0.08, taskFraction(t, agents))
+      return seg(ownerColor(t.owner), 0.3, w) + seg(ownerColor(t.owner), 1, w * f)
     })
     .join('')
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="6" viewBox="0 0 ${width} 6">${rects}</svg>`
+}
+
+/** what Opus is up to, in one line under the header */
+function opusLine(m: Mission, ph: ReturnType<typeof phase>, running: number): string {
+  if (ph === 'waiting') return `asks: ${m.note}`
+  if (m.status !== 'holding') return m.doing
+  if (ph === 'standby') return `standing by: ${m.note}`
+  return running ? `watching ${running} agent${running > 1 ? 's' : ''} cook · ${m.note}` : `cooking: ${m.note}`
 }
 
 function segmentsText(tasks: readonly Task[]): string {
@@ -549,24 +590,25 @@ function drawPane($: EngineInterface, table: Kit, v: View) {
     }
     const p = progress(m, agents)
     const left = eta(m, agents, now)
-    const tone = m.status === 'done' ? COLOR.done : m.status === 'waiting' || m.status === 'holding' ? COLOR.wait : m.status === 'stopped' ? COLOR.track : COLOR.opus
+    const ph = phase(m, agents)
+    const tone = ph === 'done' ? COLOR.done : ph === 'waiting' || ph === 'standby' ? COLOR.wait : ph === 'stopped' ? COLOR.track : COLOR.opus
     const word =
-      m.status === 'done'
+      ph === 'done'
         ? `Done ✓ in ${minutes(m.endedAt - m.startedAt)}`
-        : m.status === 'stopped'
+        : ph === 'stopped'
           ? 'Stopped'
-          : m.status === 'waiting'
+          : ph === 'waiting'
             ? 'Waiting on you'
-            : m.status === 'holding'
-              ? `On hold · ${p.doneN} of ${p.n} tasks done`
+            : ph === 'standby'
+              ? `Standing by · ${p.doneN} of ${p.n} tasks done`
               : m.planAt
-                ? `${p.doneN} of ${p.n} tasks done`
-                : 'Planning…'
+                ? `${spin(now)} Cooking · ${p.doneN} of ${p.n} tasks done`
+                : `${spin(now)} Planning…`
     const live = isLive(m)
     const meta = [
       live ? `⏱ ${minutes(now - m.startedAt)}` : '',
       left !== null ? `~${minutes(left)} left` : '',
-      m.status === 'holding' ? (m.holdUntil ? `wakes in ${minutes(Math.max(0, m.holdUntil - now))}` : 'wakes on a notification') : '',
+      m.status === 'holding' ? (m.holdUntil ? `checks back in ${minutes(Math.max(0, m.holdUntil - now))}` : 'checks back on a notification') : '',
       settings.auto ? `autopilot ${m.continues}/${settings.maxContinues}` : 'autopilot off',
     ].filter(Boolean)
     return (
@@ -581,7 +623,7 @@ function drawPane($: EngineInterface, table: Kit, v: View) {
         </Box>
         {m.planAt > 0 &&
           (Svg ? (
-            <Svg source={segmentsSvg(m.tasks, Math.max(120, Math.min(width, 90) * 7))} alt={`${p.doneN} of ${p.n} tasks done`} />
+            <Svg source={segmentsSvg(m.tasks, agents, Math.max(120, Math.min(width, 90) * 7))} alt={`${p.doneN} of ${p.n} tasks done`} />
           ) : (
             <Text color={tone}>{segmentsText(m.tasks)}</Text>
           ))}
@@ -589,7 +631,7 @@ function drawPane($: EngineInterface, table: Kit, v: View) {
         {live && (
           <Text wrap="truncate-end">
             <Text color={COLOR.opus} bold>Opus 5.5 </Text>
-            <Text dimColor>{m.status === 'waiting' ? `asks: ${m.note}` : m.status === 'holding' ? `holds: ${m.note}` : m.doing}</Text>
+            <Text dimColor>{opusLine(m, ph, agents.filter(a => a.status === 'running').length)}</Text>
           </Text>
         )}
       </Box>
@@ -614,8 +656,8 @@ function drawPane($: EngineInterface, table: Kit, v: View) {
           <Text dimColor>{`${minutes(now - a.startedAt)} · ${a.tools} tools`}</Text>
         </Box>
         <Box flexDirection="row" columnGap={1} alignItems="center">
-          {bar(a.pct / 100, tone, Math.min(24, Math.max(8, width - 30)))}
-          <Text dimColor>{a.pct ? `${a.pct}%` : 'working…'}</Text>
+          {bar(Math.max(0.03, agentPct(a) / 100), tone, Math.min(24, Math.max(8, width - 30)))}
+          <Text dimColor>{`${spin(now + a.startedAt)} ${pctLabel(a)}`}</Text>
         </Box>
         <Text dimColor wrap="truncate-end">{`▸ ${a.doing}`}</Text>
       </Box>
@@ -696,7 +738,7 @@ function drawPane($: EngineInterface, table: Kit, v: View) {
         {m?.status === 'holding' && (
           <Button
             key="conduct-resume"
-            label="Resume now"
+            label={m.stalls > 0 ? 'Resume now' : 'Check now'}
             onPress={async () => {
               const cur = await update($, missionAtom, x => (x ? { ...x, status: 'running' as const, holdUntil: 0, nudgedAt: 0, pendingAt: 0, doing: 'resumed by you' } : x))
               if (cur) void $.prompt.submit({ text: holdExpired(cur) })

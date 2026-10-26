@@ -2,6 +2,14 @@
 
 Opus 5.5 is the thinker, manager and integrator. Sonnet 5.5 workers do the hard labor, and Haiku 5.5 scouts do fast, narrow jobs. It's the SOL orchestrator idea (Sol → Opus, Luna → Sonnet) with a `/goal`-style live board.
 
+## Install
+
+```
+/plugin install opus-conductor --marketplace okashiina/illa-mods
+```
+
+On older Claude Code: `/plugin marketplace add okashiina/illa-mods`, then `/plugin install opus-conductor@illa-mods`. Restart or run `/reload-plugins`. Update later with `claude plugin update opus-conductor@illa-mods`.
+
 ## Use
 
 | Type | Does |
@@ -40,11 +48,12 @@ In the desktop app, type `/conduct` and pick **conduct (opus-conductor)** from t
   - An explicit Opus or Sonnet choice is kept.
 - **Autopilot:** it nudges Opus to continue, at most 8 times, while tasks are open and no worker is running. Opus can pause it to ask you a question (`wait`) or to wait on the outside world (`hold`).
 - **No nudge spam (1.5):** autopilot never asks twice for nothing.
-  - `hold`: Opus says what it waits on and, optionally, after how many minutes to check again. The band shows "on hold · 12m left" or "on hold · until a notification".
+  - `hold`: Opus says what it waits on and, optionally, after how many minutes to check again. While work goes on (agents running, a background task, the outside job), the board says "cooking" with a spinner. Only a stall with nothing running says "standing by · 12m left".
   - Stall detection: a nudged turn that changed nothing on the board (no task moved, no agent started, no file written) puts the mission on hold for 5 min, doubling per stall in a row up to 30 min, instead of nudging again.
   - Background work: a turn in which Opus started a background command or a monitor is held too, since its notification wakes the session.
   - Waking: a task notification, a peer message, a scheduled trigger, or you typing resumes the mission at once. The timer wakes Opus once with "check whether it's ready; if not, hold again". The board has a "Resume now" button.
   - Your message also resets the stall count and the autopilot budget.
+- **Live bars (1.6):** each agent's bar moves with every tool call. Before its first report it shows an estimate from its tool calls (`~14%`), and after a report it creeps up until the next one. A task whose agent handed back counts 90% until Opus verifies it, and active plan segments fill with their agent's %.
 - **Session model:** run the session on Opus 5.5 for the intended split. If it isn't, the board shows a warning when Opus first hands off a task.
 
 ## Develop

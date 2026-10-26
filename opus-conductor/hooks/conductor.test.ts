@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { applyAction, continuation, describeCall, effortOf, fingerprint, holdExpired, newMission, progress, stallHold, steerModel, taskIdIn } from './mission'
+import { agentPct, applyAction, continuation, describeCall, effortOf, fingerprint, holdExpired, newMission, phase, progress, stallHold, steerModel, taskIdIn } from './mission'
 
 const PANE = { component: 'Pane', requestId: 'opus-conductor', props: { title: 'Opus Conductor', isFocused: false, bodyColumns: 80, placement: 'dock' } as never } as const
 
@@ -93,11 +93,11 @@ test('a finished mission does not pin the board at 100%: more work reopens it, a
     await ui.unmount()
     return text
   }
-  expect(await draw()).toBe('1 of 2 tasks done')
+  expect(await draw()).toMatch(/Cooking · 1 of 2 tasks done$/)
 
   await call({ action: 'complete' })
   await call({ action: 'plan', tasks: [{ title: 'brand new mission' }] })
-  expect(await draw()).toBe('0 of 1 tasks done')
+  expect(await draw()).toMatch(/Cooking · 0 of 1 tasks done$/)
 })
 
 test('a bash step reads as the command that matters', async () => {
@@ -211,7 +211,7 @@ test('autopilot nudges once, holds after a turn that changed nothing, and a noti
 
   // the pane says so
   const ui = await $.ui.mount({ plugin: 'opus-conductor', surface: 'terminal', ...PANE })
-  expect(await ui.find({ type: 'Text', text: /On hold/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Standing by/ })).toBeDefined()
   expect(await ui.find({ key: 'conduct-resume' })).toBeDefined()
   await ui.unmount()
 
@@ -296,4 +296,47 @@ test('an explicit "hold" with a timer wakes Opus when it runs out; a background 
   expect((await mission()).status).toBe('holding')
   expect((await mission()).note).toMatch(/background task/)
   expect((await mission()).holdUntil).toBe(clock.now() + 15 * 60000)
+})
+
+test('an agent\'s bar moves with its tool calls: an estimate before it reports, a creep after', async () => {
+  const row = { id: 'a1', label: '', model: 'claude-sonnet-5-5', type: '', startedAt: 0, endedAt: 0, status: 'running' as const, tools: 0, doing: '', pct: 0, taskId: 1, summary: '' }
+  expect(agentPct(row)).toBe(0)
+  expect(agentPct({ ...row, tools: 6 })).toBeGreaterThan(10)
+  expect(agentPct({ ...row, tools: 23 })).toBeGreaterThan(agentPct({ ...row, tools: 6 }))
+  expect(agentPct({ ...row, tools: 500 })).toBeLessThan(80)
+  expect(agentPct({ ...row, tools: 10, pct: 40, pctTools: 10 })).toBe(40)
+  expect(agentPct({ ...row, tools: 14, pct: 40, pctTools: 10 })).toBe(46)
+  expect(agentPct({ ...row, tools: 99, pct: 90, pctTools: 10 })).toBe(95)
+  expect(agentPct({ ...row, status: 'done' })).toBe(100)
+
+  // a task whose agent made calls but never reported still moves the mission
+  let m = applyAction(newMission('x', 0), { action: 'plan', tasks: [{ title: 'build', size: 'M' }] }, 1).mission
+  m = applyAction(m, { action: 'start', ids: [1] }, 2).mission
+  expect(progress(m, [{ ...row, tools: 20 }]).pct).toBeGreaterThan(0)
+  // its agent handed back but Opus hasn't verified yet: 90%, not 0
+  expect(progress(m, [{ ...row, status: 'done' }]).pct).toBe(90)
+})
+
+test('a hold while work goes on reads as cooking; only a stall with nothing running stands by', async ($, on) => {
+  mock.clock(on, { now: 1000 })
+  mock.store(on)
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.status', () => ({ value: undefined }))
+  on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'w1' }))
+  const row = { id: 'a1', label: '', model: 'claude-sonnet-5-5', type: '', startedAt: 0, endedAt: 0, status: 'running' as const, tools: 3, doing: '', pct: 0, taskId: 1, summary: '' }
+  const held = applyAction(applyAction(newMission('x', 0), { action: 'plan', tasks: [{ title: 'build' }] }, 1).mission, { action: 'hold', note: '6 workers running' }, 2).mission
+  expect(phase(held, [row])).toBe('cooking')
+  expect(phase(held, [])).toBe('cooking')
+  expect(phase({ ...held, stalls: 1 }, [])).toBe('standby')
+  expect(phase({ ...held, stalls: 1 }, [row])).toBe('cooking')
+
+  await $.tool.call({ tool: 'mcp__opus-conductor__mission', action: 'plan', tasks: [{ title: 'write the lexer' }] } as never)
+  await $.agent.spawn({ prompt: 'go', description: '#1 write the lexer', subagentType: 'opus-conductor:worker-medium' } as never)
+  await $.tool.call({ tool: 'mcp__opus-conductor__mission', action: 'hold', note: 'workers running' } as never)
+  const ui = await $.ui.mount({ plugin: 'opus-conductor', surface: 'terminal', ...PANE })
+  expect(await ui.find({ type: 'Text', text: /Cooking/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /On hold/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /watching 1 agent cook/ })).toBeDefined()
+  expect((await ui.find({ key: 'conduct-resume' }))?.props.label).toBe('Check now')
+  await ui.unmount()
 })

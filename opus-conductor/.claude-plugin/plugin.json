@@ -1,7 +1,7 @@
 {
   "name": "opus-conductor",
-  "version": "1.5.0",
-  "description": "Opus 5.5 conducts a mission: plans sized tasks, delegates hard labor to Sonnet 5.5 workers and narrow jobs to Haiku 5.5 scouts at the reasoning effort each task needs, shows every agent and the mission's % in a live pane, and holds its autopilot while Opus waits on the outside world instead of nudging it",
+  "version": "1.6.0",
+  "description": "Opus 5.5 conducts a mission: plans sized tasks, delegates hard labor to Sonnet 5.5 workers and narrow jobs to Haiku 5.5 scouts at the reasoning effort each task needs, shows every agent and the mission's % in a live pane, shows \"cooking\" with live-moving bars while agents work, and holds its autopilot while Opus waits on the outside world instead of nudging it",
   "author": {
     "name": "illa"
   },

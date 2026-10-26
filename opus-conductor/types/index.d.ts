@@ -59,6 +59,8 @@ export type AgentRow = {
   tools: number
   doing: string
   pct: number
+  /** its tool count when it last reported pct: the bar creeps from there until the next report */
+  pctTools?: number
   taskId: number
   /** the effort its agent type runs at; absent for agents that aren't the conductor's */
   effort?: Effort
